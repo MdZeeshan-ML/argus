@@ -68,12 +68,13 @@ model on the user's specific threat environment.
 Build in this exact sequence. Do not start the next phase until the current
 one is verified working. Check HANDOFF.md for current position.
 
-### Phase 1 — Core Daemon (Sessions 1–3)
+### Phase 1 — Core Daemon (Sessions 1–4)
 1. `argus/core/logger.py` ✅ — SQLite logging, SHA-256 hash-chained, tamper-evident
-2. `argus/monitors/file_watcher.py` ✅ — watchdog Downloads + Desktop, .crdownload handler
+2. `argus/monitors/file_watcher.py` ✅ — watchdog Downloads (staging zone) + Desktop; staged flag routes events
 3. `argus/monitors/email_scanner.py` ✅ — IMAP poller, UID tracking, BODY.PEEK, metadata+links
-4. `argus/analysis/feature_extractor.py` — metadata extraction (hash, magic bytes, entropy, WHOIS)
-5. `argus/core/daemon.py` — main event loop wiring monitors to extractor
+4. `argus/analysis/feature_extractor.py` ✅ — hash, magic bytes, entropy, PE metadata, WHOIS, Zone.Identifier ADS
+4a. `argus/core/gate_keeper.py` ✅ — Quarantine-First four-gate pipeline for Downloads staging zone
+5. `argus/core/daemon.py` — main event loop: staged events → gate_keeper; desktop events → extractor → inference
 6. Manual test: trigger a fake suspicious file, verify SQLite log entry
 
 ### Phase 2 — Inference Layer
@@ -145,6 +146,7 @@ Every error that gets fixed makes A.R.G.U.S. stronger.
 Short commands → exact file targets:
 - "build the logger" → `argus/core/logger.py`
 - "build the watcher" → `argus/monitors/file_watcher.py`
+- "build the gate keeper" → `argus/core/gate_keeper.py`
 - "build the scanner" → `argus/monitors/email_scanner.py`
 - "build the extractor" → `argus/analysis/feature_extractor.py`
 - "wire the daemon" → `argus/core/daemon.py`
@@ -178,11 +180,28 @@ deterministic. Never dispatch silently — say what you're delegating and why.
 ## Architecture Rules — Never Violate These
 
 ### Data Flow
+
+**Downloads staging zone (Quarantine-First pipeline):**
+```
+File lands in ~/Downloads (ACL: deny-execute) →
+Gate 1: Windows Defender (MpCmdRun.exe, 60s) →
+Gate 1.5: VirusTotal SHA-256 lookup (optional, httpx) →
+Gate 2: Feature extraction + RAG context + LLM inference →
+Gate 3: Dynamic sandbox OR HUMAN_DECISION_REQUIRED →
+CLEARED → ~/Downloads/Cleared/ (normal permissions)
+QUARANTINED → ~/.argus/quarantine/
+```
+
+**Desktop / email pipeline (original):**
 ```
 Event trigger → Feature extraction → RAG context retrieval →
 LLM inference (local or cloud) → Verdict → SQLite log →
 [notify user] [quarantine if needed] [cloud sync async]
 ```
+
+**Routing in daemon:**
+`event.staged == True` → gate_keeper.process(event)
+`event.staged == False` → extractor.extract(event) → inference → logger
 
 ### Privacy Boundary — CRITICAL
 - Never pass raw file contents to any LLM (local or cloud)
@@ -485,15 +504,20 @@ argus/                           <- repo root
 │   ├── core/
 │   │   ├── daemon.py
 │   │   ├── config.py
+│   │   ├── gate_keeper.py       ✅ built — four-gate pipeline for Downloads staging zone
 │   │   └── logger.py            ✅ built
 │   ├── monitors/
-│   │   ├── file_watcher.py      ✅ built
+│   │   ├── file_watcher.py      ✅ built — staged flag routes Downloads vs Desktop
 │   │   ├── email_scanner.py     ✅ built
 │   │   ├── package_monitor.py
 │   │   ├── browser_monitor.py
 │   │   └── clipboard_monitor.py
 │   ├── analysis/
-│   │   ├── feature_extractor.py
+│   │   ├── feature_extractor.py ✅ built — hash, magic, entropy, PE, WHOIS, Zone.Identifier
+│   │   ├── dynamic/             <- Gate 3 sandbox modules (Phase 3)
+│   │   │   ├── sandbox_python.py
+│   │   │   ├── sandbox_node.py
+│   │   │   └── process_monitor.py
 │   │   ├── rag/
 │   │   │   ├── embedder.py
 │   │   │   ├── threat_feeds.py

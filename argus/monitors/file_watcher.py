@@ -1,10 +1,18 @@
 # A.R.G.U.S. — Automated Real-time Guardian for User Systems
 # Copyright (C) 2026  MdZeeshan-ML | GPL v3
 """
-Watchdog-based file monitor for Downloads and Desktop directories.
+Watchdog-based file monitor for Downloads (staging zone) and Desktop.
 
-Puts a structured event dict into a queue.Queue on every new file creation.
-The daemon (core/daemon.py) owns that queue and dispatches events to the extractor.
+Architecture note:
+  Downloads is the gate pipeline staging zone — files arriving there are
+  processed through gate_keeper.py (Defender → VirusTotal → Static → Dynamic)
+  before being moved to Downloads/Cleared/ with normal permissions.
+
+  Desktop is monitored on the original pipeline (direct extractor → inference).
+
+Events carry a 'staged' flag so the daemon routes them correctly:
+  staged=True  → gate_keeper.process(event)
+  staged=False → extractor.extract(event) → inference → logger
 """
 
 import logging
@@ -24,6 +32,9 @@ _TEMP_SUFFIXES = {".tmp", ".crdownload", ".part", ".partial", ".download", ".!ut
 # Windows lock-file prefix (Office, etc.)
 _TEMP_PREFIXES = ("~$",)
 
+# Downloads is the staging zone — daemon routes these through gate_keeper
+_STAGING_DIR = Path.home() / "Downloads"
+
 
 def _is_temp_file(path: Path) -> bool:
     """Return True if this looks like an in-progress download or lock file."""
@@ -32,6 +43,15 @@ def _is_temp_file(path: Path) -> bool:
     if any(path.name.startswith(p) for p in _TEMP_PREFIXES):
         return True
     return False
+
+
+def _is_staged(path: Path) -> bool:
+    """True if the file is in the Downloads staging zone (not a subdirectory)."""
+    try:
+        # Only the root of Downloads is staged — Cleared/ subdirectory is not
+        return path.parent.resolve() == _STAGING_DIR.resolve()
+    except OSError:
+        return False
 
 
 class _FileCreatedHandler(FileSystemEventHandler):
@@ -55,15 +75,17 @@ class _FileCreatedHandler(FileSystemEventHandler):
             "source": "file_watcher",
             "path": str(path),
             "event_type": "created",
+            "staged": _is_staged(path),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self._queue.put(entry)
-        log.info("New file detected: %s", path)
+        log.info("File detected (%s): %s", "staged" if entry["staged"] else "direct", path)
 
     def on_moved(self, event) -> None:
         """
         Browsers rename .crdownload → real filename when download completes.
-        We catch that final rename here so we don't miss completed downloads.
+        We catch the final rename here so we don't miss completed downloads.
+        Cleared/ files moving out are ignored — they already passed all gates.
         """
         if event.is_directory:
             return
@@ -73,23 +95,27 @@ class _FileCreatedHandler(FileSystemEventHandler):
         if _is_temp_file(dest):
             return
 
+        # Ignore renames within Cleared/ or moves out of staging zone
+        staged = _is_staged(dest)
+
         entry = {
             "source": "file_watcher",
             "path": str(dest),
-            "event_type": "download_complete",  # rename from temp → real
+            "event_type": "download_complete",
+            "staged": staged,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self._queue.put(entry)
-        log.info("Download complete (rename): %s", dest)
+        log.info("Download complete (%s): %s", "staged" if staged else "direct", dest)
 
 
 class FileWatcher:
     """
-    Monitors one or more directories for new files.
+    Monitors Downloads (gate pipeline staging zone) and Desktop (direct pipeline).
 
     Usage:
         q = queue.Queue()
-        watcher = FileWatcher(q, watch_dirs=[Path("C:/Users/me/Downloads")])
+        watcher = FileWatcher(q)
         watcher.start()
         ...
         watcher.stop()
@@ -112,6 +138,7 @@ class FileWatcher:
             if not d.exists():
                 log.warning("Watch dir does not exist, skipping: %s", d)
                 continue
+            # recursive=False: Downloads/Cleared/ files are already clean — don't re-process
             self._observer.schedule(self._handler, str(d), recursive=False)
             log.info("Watching: %s", d)
             scheduled += 1
@@ -131,11 +158,11 @@ class FileWatcher:
 
 
 def _default_watch_dirs() -> list[Path]:
-    """Resolve Downloads and Desktop from the current user's home directory."""
+    """Staging zone (Downloads) + direct pipeline (Desktop)."""
     home = Path.home()
     return [
-        home / "Downloads",
-        home / "Desktop",
+        home / "Downloads",  # staged=True  → gate pipeline
+        home / "Desktop",    # staged=False → direct pipeline
     ]
 
 
