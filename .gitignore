@@ -1,0 +1,40 @@
+# === SECRETS — never commit these ===
+.env
+configs/config.json
+configs/service_account.json
+data/personal_whitelist.json
+data/my_clients.json
+
+# === LOCAL ARGUS DATA (outside project, but just in case) ===
+~/.argus/
+
+# === GENERATED ARTIFACTS ===
+*.db
+*.sqlite
+models/
+logs/
+chroma_db/
+
+# === THREAT FEED DATA ===
+data/threat_feeds/
+data/training/
+
+# === PYTHON ===
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# === IDE ===
+.vscode/settings.json
+.idea/
+
+# === SESSION FILES (gitignored per CLAUDE.md) ===
+HANDOFF.md
+CLAUDE.local.md

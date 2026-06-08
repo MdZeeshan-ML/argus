@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "argus"
+version = "0.1.0"
+description = "A.R.G.U.S. — Automated Real-time Guardian for User Systems"
+license = { text = "GPL-3.0-only" }
+requires-python = ">=3.11"
+dependencies = [
+    "watchdog",
+    "python-magic-bin; sys_platform == 'win32'",
+    "pefile",
+    "openai",
+    "chromadb",
+    "sentence-transformers",
+    "pystray",
+    "Pillow",
+    "pywebview",
+    "fastapi",
+    "uvicorn[standard]",
+    "plyer",
+    "weasyprint",
+    "google-cloud-bigquery",
+    "google-cloud-storage",
+    "google-api-python-client",
+    "google-auth",
+    "python-dotenv",
+    "httpx",
+    "schedule",
+    "dnspython",
+    "python-whois",
+]
+
+[project.scripts]
+argus = "argus.core.daemon:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["argus*"]
