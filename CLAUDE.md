@@ -33,11 +33,11 @@ model weights back to the community.
 
 ## Developer Context
 
-- Developer: Zeeshan (solo, IIT Madras data science student)
+- Developer: solo contributer
 - Experience: Strong Python, SQL, BeautifulSoup. Minimal prior GUI/async experience.
 - Learning style: Build incrementally. Explain decisions when making non-obvious choices.
   Do NOT write large code dumps. Build one module at a time, verify it works, move on.
-- Time budget: 1–2 hours/day
+- Time budget: limited daily hours
 - Tutor mode: YES. Explain what each component does and why as you build it.
   But keep explanations inline as comments — do not write essays in chat.
 
