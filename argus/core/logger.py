@@ -1,3 +1,5 @@
+# A.R.G.U.S. — Automated Real-time Guardian for User Systems
+# Copyright (C) 2026  MdZeeshan-ML | GPL v3
 """
 SQLite incident logger with tamper-evident append-only design.
 

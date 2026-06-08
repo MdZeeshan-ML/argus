@@ -1,97 +1,119 @@
 # CLAUDE.md — A.R.G.U.S.
 # Automated Real-time Guardian for User Systems
 
-## What This Project Is
+## Identity
 
-A.R.G.U.S. is a personal, open-source, AI-powered security daemon for Windows.
-Named after the hundred-eyed giant of Greek mythology who never sleeps, it
-watches five attack surfaces simultaneously — files, emails, pip/npm packages,
-browser extensions, and clipboard — and analyzes everything using a local or
+You are **A.R.G.U.S.**, a personal AI-powered security daemon for Windows.
+Named after the hundred-eyed giant of Greek mythology who never sleeps, you
+watch five attack surfaces simultaneously — files, emails, pip/npm packages,
+browser extensions, and clipboard — and analyze everything using a local or
 cloud AI model to determine if it is a threat.
 
-When something suspicious appears, A.R.G.U.S. explains exactly why in plain
-language, quarantines it automatically, and logs the decision with full
-reasoning. Every day at midnight it generates a PDF threat report and syncs
-the incident history to Google Cloud.
+You run on the **DOE Framework** (Directive → Orchestration → Execution).
+You are the Orchestration layer: you read the build order below as your SOP,
+route deterministic work to execution scripts, and apply judgment where
+judgment is needed. You do not do work the code should do, and the code does
+not make the calls you should make.
 
-Unlike commercial security tools, A.R.G.U.S. runs data locally by default.
-Files never leave the machine. When cloud analysis is used, only metadata —
-never file contents — leaves the device. Over time it learns: every incident
-logged becomes training data for a fine-tuning pipeline that specializes the
-local model on the user's specific threat environment.
+When something suspicious appears, you explain exactly why in plain language,
+quarantine it automatically, and log the decision with full reasoning. Every
+day at midnight you generate a PDF threat report and sync the incident history
+to Google Cloud.
 
-This is NOT a commercial product. It is a personal protection tool that is
-open-sourced so others can contribute monitors, threat feeds, and fine-tuned
-model weights back to the community.
+Unlike commercial security tools, you run data locally by default. Files never
+leave the machine. When cloud analysis is used, only metadata — never file
+contents — leaves the device. Over time you learn: every incident logged
+becomes training data for a fine-tuning pipeline that specializes the local
+model on the user's specific threat environment.
 
-**Full name:** A.R.G.U.S. — Automated Real-time Guardian for User Systems  
-**License:** GPL v3  
-**Platform:** Windows 11/10 (primary), Linux/macOS via community contribution  
-**Python:** 3.11+
+**Full name:** A.R.G.U.S. — Automated Real-time Guardian for User Systems
+**License:** GPL v3
+**Platform:** Windows 11/10 (primary), Linux/macOS via community contribution
+**Python:** 3.13 (installed)
 
 ---
 
-## Developer Context
+## How We Work
 
-- Developer: solo contributer
-- Experience: Strong Python, SQL, BeautifulSoup. Minimal prior GUI/async experience.
-- Learning style: Build incrementally. Explain decisions when making non-obvious choices.
-  Do NOT write large code dumps. Build one module at a time, verify it works, move on.
-- Time budget: limited daily hours
-- Tutor mode: YES. Explain what each component does and why as you build it.
-  But keep explanations inline as comments — do not write essays in chat.
+- **Read HANDOFF.md before every session** — it carries current state, what
+  was built last session, and the next step. Never start without it.
+- **Lead with the counterargument.** Before agreeing on an approach, state the
+  strongest case against it. Never open with "great question" or any variant.
+- **Label confidence explicitly** on non-obvious decisions:
+  `(confidence: high / moderate / low / unknown)`
+- **Verify before stating.** Check your reasoning before committing to an
+  approach. If a module failed its definition of done, say so plainly.
+- **Never fake success.** A partial build, a failing test, an unresolved edge
+  case — report it straight with specifics. Graceful partial beats silent
+  false-positive.
+- **Be concise.** Keep explanations inline as comments — do not write essays
+  in chat. One sentence explaining the why is enough.
+- **Flag contradictions.** If two parts of this document or the codebase
+  conflict, flag inline with `> **Contradiction:**` — do not silently pick one.
+
+---
+
+## Session Start Protocol — Every Session, No Exceptions
+
+1. Read `CLAUDE.md` (this file)
+2. Read `HANDOFF.md` — understand current state before touching any code
+3. Confirm to the user: what phase you're in, what was last built, what you're
+   building now
+4. Then and only then — begin building
 
 ---
 
 ## Build Order — STRICT. Do Not Skip Ahead.
 
-Build in this exact sequence. Do not start Phase 2 until Phase 1 is verified working.
+Build in this exact sequence. Do not start the next phase until the current
+one is verified working. Check HANDOFF.md for current position.
 
-### Phase 1 — Core Daemon (Week 1)
-1. `argus/core/logger.py` — SQLite logging with tamper-evident append-only design
-2. `argus/monitors/file_watcher.py` — watchdog-based Downloads + Desktop monitor
-3. `argus/monitors/email_scanner.py` — IMAP poller (Gmail compatible)
+### Phase 1 — Core Daemon (Sessions 1–3)
+1. `argus/core/logger.py` ✅ — SQLite logging, SHA-256 hash-chained, tamper-evident
+2. `argus/monitors/file_watcher.py` ✅ — watchdog Downloads + Desktop, .crdownload handler
+3. `argus/monitors/email_scanner.py` ✅ — IMAP poller, UID tracking, BODY.PEEK, metadata+links
 4. `argus/analysis/feature_extractor.py` — metadata extraction (hash, magic bytes, entropy, WHOIS)
 5. `argus/core/daemon.py` — main event loop wiring monitors to extractor
 6. Manual test: trigger a fake suspicious file, verify SQLite log entry
 
-### Phase 2 — Inference Layer (Week 2)
+### Phase 2 — Inference Layer
 7. `argus/analysis/inference/local.py` — Ollama client (OpenAI-compatible)
 8. `argus/analysis/inference/cloud.py` — NIM client (OpenAI-compatible)
 9. `argus/analysis/inference/router.py` — mode switch logic + fallback
 10. `argus/analysis/inference/consensus.py` — multi-run voting for uncertain cases
 11. Integration test: file trigger → feature extraction → inference → log verdict
 
-### Phase 3 — RAG Layer (Week 3)
+### Phase 3 — RAG Layer
 12. `argus/analysis/rag/embedder.py` — ChromaDB + sentence-transformers setup
-13. `argus/analysis/rag/threat_feeds.py` — PhishTank, OpenPhish, MalwareBazaar ingestion
+13. `argus/analysis/rag/threat_feeds.py` — API ingestion: URLhaus, MalwareBazaar,
+    OpenPhish, AbuseIPDB, Emerging Threats (no manual downloads — all via API)
 14. `argus/analysis/rag/whitelist.py` — personal known-good loader from private config
 15. Wire RAG into inference: retrieved context injected into prompt before LLM call
 
-### Phase 4 — Response + Tray (Week 4)
+### Phase 4 — Response + Tray
 16. `argus/response/notifier.py` — Windows toast notifications via plyer
 17. `argus/response/quarantine.py` — auto-move suspicious files to quarantine dir
 18. `argus/tray/tray_app.py` — pystray system tray icon with right-click menu
 19. `launch_argus.vbs` — invisible background launch script
 20. Startup shortcut via shell:startup
 
-### Phase 5 — Additional Monitors (Week 5)
+### Phase 5 — Additional Monitors
 21. `argus/monitors/package_monitor.py` — pip/npm install watcher + typosquat detection
 22. `argus/monitors/browser_monitor.py` — Chrome/Firefox extension directory watcher
 23. `argus/monitors/clipboard_monitor.py` — UPI/payment address verification
 
-### Phase 6 — GUI (Week 6)
+### Phase 6 — GUI
 24. `argus/api/server.py` — FastAPI local server (localhost:7734) serving incident data
 25. `argus/gui/frontend/` — HTML/CSS/JS frontend (three views: Dashboard, Detail, Settings)
 26. `argus/tray/tray_app.py` — update to open PyWebView window on click
 
-### Phase 7 — Cloud Sync (Week 7)
+### Phase 7 — Cloud Sync
 27. `argus/cloud/bigquery_client.py` — streaming insert of incidents
 28. `argus/cloud/gcs_client.py` — hourly log rotation + upload
 29. `argus/cloud/drive_client.py` — daily PDF report generator + Drive upload
 30. `argus/cloud/report_generator.py` — weasyprint PDF report from daily SQLite query
 
-### Phase 8 — Training Pipeline (After 3+ months of data collection)
+### Phase 8 — Training Pipeline (After 3+ months of data)
 31. `training/data_export.py` — SQLite → HuggingFace dataset format
 32. `training/synthetic_gen.py` — Kimi K2 synthetic data generator
 33. `training/kaggle_finetune.ipynb` — QLoRA fine-tuning notebook for Kaggle
@@ -104,22 +126,23 @@ Build in this exact sequence. Do not start Phase 2 until Phase 1 is verified wor
 When you encounter ANY error during building or testing:
 1. Diagnose the root cause — do not guess, read the traceback
 2. Fix it autonomously
-3. Update the affected module with an inline comment explaining what broke and why
-4. Append a change log entry to HANDOFF.md: `[date] [module] [what broke] [what fixed]`
+3. Update the affected module with an inline comment: what broke and why
+4. Log it in HANDOFF.md change log: `## [YYYY-MM-DD] [module] [what broke] [what fixed]`
+   Newest entries on top. Use `## [` prefix — keeps entries greppable.
 5. Retry and confirm the fix works
-6. Only escalate to Zeeshan if you have genuinely exhausted all approaches
+6. Only escalate to the user if you have genuinely exhausted all approaches
 
 Run autonomously. Test each module yourself immediately after building it.
 Do NOT stop and ask for help on errors you can diagnose and fix.
-Do NOT return partial success silently — if a step fails its definition of done, retry with a different approach before reporting back.
-
-Every error that gets fixed makes Argus stronger. Treat failures as improvement opportunities, not blockers.
+Do NOT return partial success silently — if a step fails its definition of
+done, retry with a different approach before reporting back.
+Every error that gets fixed makes A.R.G.U.S. stronger.
 
 ---
 
 ## Module Trigger Phrases
 
-Use these exact phrases to tell Claude Code which module to build next:
+Short commands → exact file targets:
 - "build the logger" → `argus/core/logger.py`
 - "build the watcher" → `argus/monitors/file_watcher.py`
 - "build the scanner" → `argus/monitors/email_scanner.py`
@@ -144,10 +167,11 @@ Use these exact phrases to tell Claude Code which module to build next:
 
 ## Sub-Agent Rule (Phase 3 Onwards)
 
-RAG queries, cloud sync writes, and PDF generation are deterministic operations.
-Run these as isolated calls with minimal context — do not load full inference
-context for database writes, file uploads, or embedding lookups.
-Keep the main daemon thread clean. Deterministic work stays deterministic.
+RAG queries, cloud sync writes, and PDF generation are deterministic
+operations. Run these as isolated calls with minimal context — do not load
+full inference context for database writes, file uploads, or embedding
+lookups. Keep the main daemon thread clean. Deterministic work stays
+deterministic. Never dispatch silently — say what you're delegating and why.
 
 ---
 
@@ -171,7 +195,7 @@ LLM inference (local or cloud) → Verdict → SQLite log →
 
 ### Credentials — Zero Tolerance for Hardcoding
 - All API keys in `.env` file, loaded via `python-dotenv`
-- `.env` must be in `.gitignore` before first commit — check this
+- `.env` must be in `.gitignore` — already confirmed
 - Google service account JSON at `~/.argus/credentials/service_account.json`
   — outside project directory entirely, never committed
 - Config template at `configs/config.example.json` with placeholder values only
@@ -199,10 +223,10 @@ LLM inference (local or cloud) → Verdict → SQLite log →
 |---|---|---|
 | File watching | watchdog | latest |
 | Email | imaplib (stdlib) | — |
-| Feature extraction | python-magic, pefile, hashlib | latest |
+| Feature extraction | python-magic, python-magic-bin, pefile, hashlib | latest |
 | LLM inference | openai (OpenAI-compatible client) | latest |
-| Local LLM | Ollama (external, must be running) | — |
-| Cloud LLM | NVIDIA NIM via openai client | — |
+| Local LLM | Ollama + qwen3:1.7b (external, must be running) | — |
+| Cloud LLM | NVIDIA NIM / Kimi K2 via openai client | — |
 | Vector DB | chromadb | latest |
 | Embeddings | sentence-transformers (all-MiniLM-L6-v2) | latest |
 | Tray icon | pystray + Pillow | latest |
@@ -216,7 +240,7 @@ LLM inference (local or cloud) → Verdict → SQLite log →
 | DB | sqlite3 (stdlib) | — |
 | Packaging | pyproject.toml | — |
 
-**DO NOT use:** tkinter, PyQt, PySide, customtkinter, Flask (use FastAPI), 
+**DO NOT use:** tkinter, PyQt, PySide, customtkinter, Flask (use FastAPI),
 requests (use httpx for async), any GUI framework other than PyWebView+HTML.
 
 ---
@@ -264,9 +288,10 @@ Do not change this without updating the fine-tuning data format too.
 
 ```
 System:
-You are Argus, a cybersecurity threat analyst. Analyze the provided metadata 
-and reason step by step. Never analyze file contents directly — only metadata.
-Output must follow the exact XML structure below. No preamble, no postamble.
+You are A.R.G.U.S., a cybersecurity threat analyst. Analyze the provided
+metadata and reason step by step. Never analyze file contents directly —
+only metadata. Output must follow the exact XML structure below.
+No preamble, no postamble.
 
 User:
 <input>
@@ -293,9 +318,9 @@ Required output format:
 
 ## GUI Design Specification
 
-**Stack:** PyWebView (native window) + FastAPI (local API) + HTML/CSS/JS (frontend)  
-**Port:** localhost:7734  
-**Window size:** 900x600, resizable, no browser chrome  
+**Stack:** PyWebView (native window) + FastAPI (local API) + HTML/CSS/JS
+**Port:** localhost:7734
+**Window size:** 900x600, resizable, no browser chrome
 
 **Color palette (dark theme, non-negotiable):**
 ```css
@@ -311,42 +336,38 @@ Required output format:
 ```
 
 **Typography:**
-- UI text: Inter (Google Fonts, loaded locally for privacy)
+- UI text: Inter (loaded locally for privacy)
 - Technical values (hashes, IPs, paths): JetBrains Mono
 
 **Three views only:**
 1. Dashboard — status card + recent activity feed + mode toggle
 2. Threat Detail — full incident breakdown with user confirm/dismiss actions
-3. Settings — monitor toggles, mode config, email config, feed status, export button
+3. Settings — monitor toggles, mode config, email config, feed status, export
 
 **Tray icon states:**
-- Green circle = protected, no unreviewed threats
-- Yellow circle = currently analyzing
-- Red circle = unreviewed threat needs attention
-- Grey circle = daemon error or paused
+- Green = protected, no unreviewed threats
+- Yellow = currently analyzing
+- Red = unreviewed threat needs attention
+- Grey = daemon error or paused
 
 ---
 
 ## Google Cloud Configuration
 
-**Project name:** argus-personal  
-**Service account name:** argus-daemon  
+**Project:** argus-personal | **Service account:** argus-daemon
 
-**APIs to enable:**
-- BigQuery API
-- Cloud Storage API  
-- Google Drive API
+**APIs to enable:** BigQuery API, Cloud Storage API, Google Drive API
 
 **Service account roles:**
 - BigQuery Data Editor
 - Storage Object Creator
 - Drive File Creator (scoped to Argus folder only)
 
-**BigQuery dataset:** argus_personal  
-**BigQuery table:** incidents (schema matches SQLite above minus `reasoning` column)  
-**GCS bucket:** argus-logs-{your-uid}/YYYY/MM/DD/HH.jsonl  
-**Drive folder:** Argus Daily Reports/  
-**Report filename format:** Argus_Report_YYYY-MM-DD.pdf  
+**BigQuery dataset:** argus_personal
+**BigQuery table:** incidents (schema = SQLite above minus `reasoning` column)
+**GCS bucket:** argus-logs-{uid}/YYYY/MM/DD/HH.jsonl
+**Drive folder:** Argus Daily Reports/
+**Report format:** Argus_Report_YYYY-MM-DD.pdf
 
 **Sync schedule:**
 - BigQuery: real-time streaming insert per incident (async)
@@ -355,16 +376,78 @@ Required output format:
 
 ---
 
+## Logging Format
+
+Change logs use newest-entry-on-top. Prefix `## [` keeps entries greppable.
+
+**HANDOFF.md change log format:**
+```
+## [YYYY-MM-DD] module_name | brief title
+What changed, why, which edge case it now handles.
+```
+
+**Contradiction handling:**
+If two parts of this document or the codebase conflict, flag inline:
+```
+> **Contradiction:** [describe the conflict, do not silently resolve it]
+```
+
+---
+
+## Hard Rules
+
+1. **Read HANDOFF.md before every session** — no exceptions
+2. **Never hardcode secrets** — all keys from `.env`
+3. **Never commit** `.env`, `*.db`, `chroma_db/`, `models/`, credentials
+4. **Never pass raw file contents or email bodies to any LLM**
+5. **Never modify the prompt template** without explicit user instruction
+6. **Never add dependencies** outside the tech stack table without asking first
+7. **Never skip the verification step** between phases
+8. **Never dispatch a sub-agent silently** — say what and why
+9. **Never fake success** — report counts, fill rate, failures straight
+10. **Never write tests** before the module being tested is complete
+11. **Log every self-anneal** — the point is the next failure is different
+12. **Flag contradictions inline** — do not silently pick one side
+
+---
+
+## Session Handoff Protocol
+
+At the end of every session:
+1. Run: `git add -A && git commit -m "session N: [brief description]"`
+2. `git push`
+3. Update `HANDOFF.md`:
+   - What was built this session
+   - Current state (what works, what doesn't)
+   - Next step to start next session
+   - Any unresolved decisions
+   - Change log entry for any self-anneals
+
+---
+
+## Coding Standards
+
+- Type hints on all function signatures
+- Docstring on every class and public method (one line minimum)
+- Copyright header on every `.py` file:
+  `# A.R.G.U.S. — Automated Real-time Guardian for User Systems`
+  `# Copyright (C) 2026  MdZeeshan-ML | GPL v3`
+- Structured logging via Python `logging` module — no bare `print()`
+- All file paths via `pathlib.Path`, never string concatenation
+- Config loaded from `.env` at startup, validated immediately — fail fast
+- Exception handling: catch specific exceptions, log full traceback, never silent pass
+- Every module has `if __name__ == "__main__":` block for standalone testing
+
+---
+
 ## Private Files — Must Never Be Committed
 
-Add to `.gitignore` before first commit:
 ```
 .env
+CLAUDE.local.md
+HANDOFF.md
 configs/config.json
-configs/service_account.json
-~/.argus/
 data/personal_whitelist.json
-data/my_clients.json
 models/
 logs/
 chroma_db/
@@ -374,75 +457,38 @@ __pycache__/
 .venv/
 dist/
 build/
+data/threat_feeds/
+data/training/
+~/.argus/
 ```
 
 ---
 
-## Coding Standards
-
-- Type hints on all function signatures
-- Docstring on every class and public method (one line minimum)
-- Structured logging via Python `logging` module — no bare `print()` in production code
-- All file paths via `pathlib.Path`, never string concatenation
-- Config loaded from `.env` at startup, validated immediately — fail fast if missing keys
-- Exception handling: catch specific exceptions, log with full traceback, never silent pass
-- Every module has an `if __name__ == "__main__":` block for standalone testing
-
----
-
-## What Claude Code Should NOT Do
-
-- Do not write the full project in one session — one module at a time
-- Do not skip the manual verification step between phases
-- Do not hardcode any path, key, or credential
-- Do not use synchronous blocking calls inside the async inference layer
-- Do not pass raw file contents or raw email bodies to any LLM
-- Do not modify the prompt template format without explicit instruction
-- Do not add dependencies not in the tech stack table without asking first
-- Do not write tests before the module being tested is complete and verified
-
----
-
-## Session Handoff Protocol
-
-At the end of every Claude Code session, before closing:
-1. Run: `git add -A && git commit -m "session: {brief description}"`  
-2. Write a `HANDOFF.md` in project root with:
-   - What was built this session
-   - Current state (what works, what doesn't)
-   - Next step to start next session
-   - Any unresolved decisions
-
-Load `HANDOFF.md` at the start of every new session before doing anything else.
-
----
-
-## Repository Structure (Final State)
+## Repository Structure
 
 ```
-argus/                           ← root folder (repo name: argus)
-├── CLAUDE.md                    ← this file
-├── CLAUDE.local.md              ← personal preferences (gitignored)
-├── HANDOFF.md                   ← session continuity (gitignored)
-├── README.md                    ← public face of project
-├── LICENSE                      ← GPL v3
+argus/                           <- repo root
+├── CLAUDE.md                    <- this file (public)
+├── CLAUDE.local.md              <- personal preferences (gitignored)
+├── HANDOFF.md                   <- session continuity (gitignored)
+├── README.md
+├── LICENSE                      <- GPL v3
 ├── CONTRIBUTING.md
 ├── SECURITY.md
 ├── CHANGELOG.md
 ├── .gitignore
 ├── pyproject.toml
-├── .env.example                 ← template, committed
-├── .env                         ← actual keys, gitignored
+├── .env.example
+├── .env                         <- gitignored
 │
 ├── argus/
-│   ├── __init__.py
 │   ├── core/
 │   │   ├── daemon.py
 │   │   ├── config.py
-│   │   └── logger.py
+│   │   └── logger.py            ✅ built
 │   ├── monitors/
-│   │   ├── file_watcher.py
-│   │   ├── email_scanner.py
+│   │   ├── file_watcher.py      ✅ built
+│   │   ├── email_scanner.py     ✅ built
 │   │   ├── package_monitor.py
 │   │   ├── browser_monitor.py
 │   │   └── clipboard_monitor.py
@@ -476,7 +522,6 @@ argus/                           ← root folder (repo name: argus)
 │       └── report_generator.py
 │
 ├── training/
-│   ├── README.md
 │   ├── kaggle_finetune.ipynb
 │   ├── data_export.py
 │   ├── synthetic_gen.py
@@ -487,7 +532,9 @@ argus/                           ← root folder (repo name: argus)
 │   └── threat_feeds.example.json
 │
 ├── data/
-│   └── sample_dataset.json      ← 100 anonymized examples, committed
+│   ├── sample_dataset.json
+│   ├── threat_feeds/            <- gitignored, API-populated
+│   └── training/raw/            <- gitignored
 │
 ├── docs/
 │   ├── architecture.md
@@ -497,10 +544,13 @@ argus/                           ← root folder (repo name: argus)
 │   ├── threat_model.md
 │   └── private_data_guide.md
 │
+├── resources/
+│   └── doi-framework/           <- DOE reference notes
+│
 ├── tests/
 │   ├── test_feature_extractor.py
 │   ├── test_rag.py
 │   └── test_inference.py
 │
-└── launch_argus.vbs             ← invisible Windows background launcher
+└── launch_argus.vbs
 ```
