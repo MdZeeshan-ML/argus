@@ -347,7 +347,7 @@ class GateKeeper:
         if self._inference_router is None:
             # Graceful degradation: inference not built yet
             # Apply simple rule-based heuristics to flag obvious threats
-            verdict, confidence = _heuristic_verdict(features)
+            verdict, confidence = heuristic_verdict(features, monitor_type="file")
             if verdict != "UNANALYZED":
                 log.info("GateKeeper: heuristic gate2 verdict=%s confidence=%.2f for %s",
                          verdict, confidence or 0.0, path.name)
@@ -681,43 +681,74 @@ def _windows_sandbox_available() -> bool:
         return False
 
 
-def _heuristic_verdict(features: dict) -> tuple[str, float | None]:
+def heuristic_verdict(
+    features: dict, monitor_type: str = "file"
+) -> tuple[str, float | None]:
     """
-    Simple rule-based pre-inference heuristics for Gate 2 fallback.
+    Rule-based pre-inference heuristics for Gate 2 fallback and daemon direct pipeline.
     Returns (verdict, confidence) or (UNANALYZED, None).
 
-    Flags only clear-cut cases so we don't block everything before inference is built.
+    Called by gate_keeper (file events only) and daemon (file + email events).
+    Flags only high-confidence signals to minimise false positives.
     """
-    signals: list[str] = []
     score = 0.0
-    ext: str = features.get("extension", "")
 
-    # MZ/PE header in a non-executable extension — always high-risk masquerade
-    magic_desc = features.get("magic_bytes_desc") or ""
-    _EXE_EXTS = {'.exe', '.dll', '.scr', '.com', '.pif', '.msi', '.sys', '.ocx'}
-    if ("MZ" in magic_desc or "PE executable" in magic_desc) and ext not in _EXE_EXTS:
-        signals.append(f"PE/MZ header in {ext or 'unknown'} file — masquerade detected")
-        score += 0.75
+    if monitor_type == "file":
+        ext: str = features.get("extension", "")
 
-    # Extension/MIME mismatch from python-magic (broader coverage)
-    elif features.get("extension_mime_mismatch"):
-        signals.append("extension/MIME mismatch")
-        score += 0.4
+        # MZ/PE header in a non-executable extension — unambiguous masquerade
+        magic_desc = features.get("magic_bytes_desc") or ""
+        _EXE_EXTS = {'.exe', '.dll', '.scr', '.com', '.pif', '.msi', '.sys', '.ocx'}
+        if ("MZ" in magic_desc or "PE executable" in magic_desc) and ext not in _EXE_EXTS:
+            score += 0.75
 
-    # Very high entropy on an executable (likely packed/encrypted)
-    if features.get("entropy_is_high") and features.get("gate3_category") == "executable":
-        signals.append("high entropy executable")
-        score += 0.3
+        # Extension/MIME mismatch from python-magic (broader coverage)
+        elif features.get("extension_mime_mismatch"):
+            score += 0.4
 
-    # Origin domain is very new (< 7 days = extreme risk)
-    whois = features.get("whois") or {}
-    age = whois.get("domain_age_days")
-    if age is not None and age < 7:
-        signals.append(f"origin domain age {age} days")
-        score += 0.35
+        # Very high entropy on an executable (likely packed/encrypted)
+        if features.get("entropy_is_high") and features.get("gate3_category") == "executable":
+            score += 0.3
+
+        # Origin domain registered < 7 days ago (brand-new = extreme risk)
+        whois = features.get("whois") or {}
+        age = whois.get("domain_age_days")
+        if age is not None and age < 7:
+            score += 0.35
+
+    elif monitor_type == "email":
+        # Reply-To domain differs from From domain — classic phishing signal
+        if features.get("reply_to_mismatch"):
+            score += 0.3
+
+        # Email auth failures: SPF/DKIM/DMARC
+        spf = (features.get("spf") or "").lower()
+        dkim = (features.get("dkim") or "").lower()
+        dmarc = (features.get("dmarc") or "").lower()
+        auth_fails = sum(1 for v in [spf, dkim, dmarc] if "fail" in v)
+        if auth_fails >= 2:
+            score += 0.1 * auth_fails  # 0.2 for 2 fails, 0.3 for all three
+
+        # No plain-text alternative = phishing structure
+        if features.get("html_only"):
+            score += 0.15
+
+        # Sender domain registered < 30 days ago
+        whois_from = features.get("whois_from") or {}
+        age = whois_from.get("domain_age_days")
+        if age is not None and age < 7:
+            score += 0.35
+        elif age is not None and age < 30:
+            score += 0.15
+
+        # Reply-To domain also very new
+        whois_reply = features.get("whois_reply_to") or {}
+        reply_age = whois_reply.get("domain_age_days")
+        if reply_age is not None and reply_age < 30:
+            score += 0.2
 
     if score >= 0.6:
-        return "SUSPICIOUS", min(score, 0.95)
+        return "SUSPICIOUS", min(round(score, 4), 0.95)
 
     return "UNANALYZED", None
 

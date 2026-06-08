@@ -74,7 +74,7 @@ one is verified working. Check HANDOFF.md for current position.
 3. `argus/monitors/email_scanner.py` ✅ — IMAP poller, UID tracking, BODY.PEEK, metadata+links
 4. `argus/analysis/feature_extractor.py` ✅ — hash, magic bytes, entropy, PE metadata, WHOIS, Zone.Identifier ADS
 4a. `argus/core/gate_keeper.py` ✅ — Quarantine-First four-gate pipeline for Downloads staging zone
-5. `argus/core/daemon.py` — main event loop: staged events → gate_keeper; desktop events → extractor → inference
+5. `argus/core/daemon.py` ✅ — main event loop: staged events → gate_keeper; desktop events → extractor → inference
 6. Manual test: trigger a fake suspicious file, verify SQLite log entry
 
 ### Phase 2 — Inference Layer
@@ -502,7 +502,7 @@ argus/                           <- repo root
 │
 ├── argus/
 │   ├── core/
-│   │   ├── daemon.py
+│   │   ├── daemon.py            ✅ built — ArgusDaemon class, event routing, graceful shutdown
 │   │   ├── config.py
 │   │   ├── gate_keeper.py       ✅ built — four-gate pipeline for Downloads staging zone
 │   │   └── logger.py            ✅ built
