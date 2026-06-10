@@ -12,10 +12,10 @@ import hashlib
 import logging
 import math
 import subprocess
+import threading
 import time
 import zipfile
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -426,13 +426,22 @@ class FeatureExtractor:
                 log.debug("WHOIS failed for %s: %s", domain, e)
                 return None
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_lookup)
-            try:
-                return future.result(timeout=self._whois_timeout)
-            except FutureTimeoutError:
-                log.warning("WHOIS timeout (%ds) for %s", self._whois_timeout, domain)
-                return None
+        # Audit fix: ThreadPoolExecutor's context manager joins the worker on
+        # exit, so a hung WHOIS socket blocked the processor thread for the full
+        # hang despite the timeout. A daemon thread + join(timeout) abandons
+        # the lookup cleanly and never blocks daemon shutdown.
+        result_box: dict[str, dict | None] = {}
+
+        def _worker() -> None:
+            result_box["result"] = _lookup()
+
+        t = threading.Thread(target=_worker, daemon=True, name=f"whois-{domain}")
+        t.start()
+        t.join(timeout=self._whois_timeout)
+        if t.is_alive():
+            log.warning("WHOIS timeout (%ds) for %s — lookup abandoned", self._whois_timeout, domain)
+            return None
+        return result_box.get("result")
 
 
 # ------------------------------------------------------------------

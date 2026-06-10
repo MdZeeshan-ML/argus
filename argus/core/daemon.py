@@ -31,9 +31,12 @@ from argus.analysis.feature_extractor import FeatureExtractor
 from argus.core.gate_keeper import GateKeeper, heuristic_verdict
 from argus.core.logger import ArgusLogger
 from argus.monitors.email_scanner import EmailScanner
-from argus.monitors.file_watcher import FileWatcher
+from argus.monitors.file_watcher import FileWatcher, _is_temp_file
 
 log = logging.getLogger(__name__)
+
+# Startup sweep cap — bounds Defender scan time after long offline periods
+_SWEEP_MAX_FILES = 25
 
 
 # ------------------------------------------------------------------
@@ -172,7 +175,24 @@ def _dispatch(
 
     # ----- Downloads staging zone: four-gate pipeline -----
     if source == "file_watcher" and staged:
-        result = gate_keeper.process(event)
+        try:
+            result = gate_keeper.process(event)
+        except Exception:
+            # Audit fix: a gate-pipeline crash previously left NO SQLite record —
+            # the file sat in staging with zero audit trail. Always write a row.
+            file_name = Path(event.get("path", "?")).name
+            log.exception("Gate pipeline crashed for %s — logging fallback incident", file_name)
+            try:
+                logger.log_incident(
+                    monitor_type="file",
+                    verdict="UNANALYZED",
+                    input_summary=f"{file_name} | gate pipeline error",
+                    action_taken="ERROR",
+                    reasoning="Gate pipeline raised an exception — file held in staging zone (execute denied). See argus.log for traceback.",
+                )
+            except Exception:
+                log.exception("Fallback incident write also failed for %s", file_name)
+            return
         if result.incident_id:
             try:
                 sync_queue.put_nowait(result.incident_id)
@@ -314,6 +334,24 @@ class ArgusDaemon:
 
         # -- SQLite logger (must succeed — no daemon without logging) --
         self._logger = ArgusLogger(cfg["db_path"])
+
+        # Audit fix: the tamper-evident hash chain existed but was never verified
+        # anywhere. Check every startup — a broken chain IS a security incident.
+        chain_ok, chain_msg = self._logger.verify_chain()
+        if not chain_ok:
+            log.critical("INCIDENT LOG TAMPER CHECK FAILED: %s — log may have been modified", chain_msg)
+            self._logger.log_incident(
+                monitor_type="system",
+                verdict="SUSPICIOUS",
+                input_summary=f"Hash chain verification failed: {chain_msg}",
+                action_taken="NONE",
+                reasoning="verify_chain() failed at startup — rows were deleted or modified outside A.R.G.U.S.",
+            )
+
+        # Sweep cutoff must be read BEFORE the startup row is written,
+        # otherwise the startup timestamp would mask offline downloads
+        sweep_cutoff = self._last_incident_epoch()
+
         self._logger.log_incident(
             monitor_type="system",
             verdict="CLEAN",
@@ -338,6 +376,10 @@ class ArgusDaemon:
         # -- File watcher --
         self._file_watcher = FileWatcher(self._event_queue)
         self._file_watcher.start()
+
+        # Audit fix: files downloaded while the daemon was OFF were stranded in
+        # staging (deny-execute ACL, no event, no analysis — forever). Sweep them.
+        self._sweep_staging(sweep_cutoff)
 
         # -- Email scanner (optional) --
         if cfg["email_address"] and cfg["email_password"]:
@@ -436,6 +478,60 @@ class ArgusDaemon:
             self._logger.close()
 
         log.info("A.R.G.U.S. stopped")
+
+    def _last_incident_epoch(self) -> float | None:
+        """Epoch seconds of the most recent incident, or None on an empty DB."""
+        rows = self._logger.get_recent(limit=1) if self._logger else []
+        if not rows:
+            return None
+        try:
+            return datetime.fromisoformat(rows[0]["timestamp"]).timestamp()
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    def _sweep_staging(self, cutoff_epoch: float | None) -> None:
+        """
+        Enqueue staging-root files modified since the last recorded incident —
+        downloads that arrived while the daemon was off would otherwise stay
+        execute-denied and unanalyzed forever.
+
+        First run (empty DB): skipped — existing Downloads content is treated
+        as baseline, same first-run semantics as the email scanner.
+        """
+        if cutoff_epoch is None:
+            log.info("Staging sweep skipped — first run, existing files are baseline")
+            return
+
+        staging: Path = self._cfg["staging_dir"]
+        swept = 0
+        try:
+            for f in sorted(staging.iterdir()):
+                if swept >= _SWEEP_MAX_FILES:
+                    log.warning(
+                        "Staging sweep cap (%d) reached — remaining new files held for next restart",
+                        _SWEEP_MAX_FILES,
+                    )
+                    break
+                if not f.is_file() or _is_temp_file(f):
+                    continue
+                try:
+                    if f.stat().st_mtime <= cutoff_epoch:
+                        continue
+                except OSError:
+                    continue
+                self._event_queue.put({
+                    "source": "file_watcher",
+                    "path": str(f),
+                    "event_type": "startup_sweep",
+                    "staged": True,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                swept += 1
+        except OSError as e:
+            log.warning("Staging sweep failed (non-fatal): %s", e)
+
+        if swept:
+            log.info("Staging sweep: %d file(s) arrived while daemon was off — queued for gate pipeline", swept)
 
     def inject_event(self, event: dict) -> None:
         """

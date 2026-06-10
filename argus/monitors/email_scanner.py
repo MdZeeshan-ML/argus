@@ -63,11 +63,19 @@ def _decode_header(raw: str | bytes | None) -> str:
     """Decode RFC 2047-encoded header values (e.g. '=?UTF-8?Q?..?=')."""
     if not raw:
         return ""
-    parts = email.header.decode_header(str(raw))
+    # Audit fix: an attacker-supplied bogus charset ('=?evil?Q?x?=') raised
+    # LookupError here, aborting the entire poll cycle on one crafted email.
+    try:
+        parts = email.header.decode_header(str(raw))
+    except Exception:
+        return str(raw)
     decoded = []
     for chunk, charset in parts:
         if isinstance(chunk, bytes):
-            decoded.append(chunk.decode(charset or "utf-8", errors="replace"))
+            try:
+                decoded.append(chunk.decode(charset or "utf-8", errors="replace"))
+            except (LookupError, UnicodeError):
+                decoded.append(chunk.decode("utf-8", errors="replace"))
         else:
             decoded.append(chunk)
     return "".join(decoded)
@@ -334,18 +342,25 @@ class EmailScanner:
         state = _load_state(self._state_path)
         try:
             for folder in self._folders:
-                self._poll_folder(conn, folder, state)
+                # Audit fix: one folder failing must not skip the rest,
+                # and partial progress must persist (state saved in finally).
+                try:
+                    self._poll_folder(conn, folder, state)
+                except Exception:
+                    log.exception("Poll failed for folder %s — continuing", folder)
         finally:
             with contextlib.suppress(Exception):
                 conn.logout()
-
-        _save_state(state, self._state_path)
+            _save_state(state, self._state_path)
 
     def _poll_folder(
         self, conn: imaplib.IMAP4_SSL, folder: str, state: dict
     ) -> None:
         """Fetch new UIDs in one folder and process them. Mutates state in-place."""
-        conn.select(folder, readonly=True)
+        status, _ = conn.select(folder, readonly=True)
+        if status != "OK":
+            log.warning("SELECT failed for folder %s: %s", folder, status)
+            return
         folder_state = state.setdefault(folder, {})
 
         # First run: record the current high-water UID and exit.
@@ -376,18 +391,30 @@ class EmailScanner:
             log.debug("No new emails in %s", folder)
             return
 
-        to_process = new_uids[-_MAX_PER_POLL:]
+        # Audit fix: was [-_MAX_PER_POLL:] (newest 20) — older emails in a burst
+        # were skipped FOREVER because last_uid jumped past them. Oldest-first
+        # means the remainder is picked up on the next poll. No email is missed.
+        to_process = new_uids[:_MAX_PER_POLL]
         log.info(
             "Found %d new email(s) in %s, processing %d",
             len(new_uids), folder, len(to_process),
         )
+        if len(new_uids) > _MAX_PER_POLL:
+            log.info("Remaining %d email(s) deferred to next poll", len(new_uids) - _MAX_PER_POLL)
 
         max_uid = last_uid
         for uid in to_process:
-            self._process_message(conn, uid, folder)
+            # Audit fix: per-message isolation — a single malformed (or crafted)
+            # message must not abort the poll or block emails behind it.
+            try:
+                self._process_message(conn, uid, folder)
+            except Exception:
+                log.exception("Failed to process UID %s in %s — skipped", uid, folder)
             max_uid = max(max_uid, int(uid))
+            # Advance high-water mark per message so a later crash never re-serves
+            # an already-handled (or poison) UID.
+            folder_state["last_uid"] = max_uid
 
-        folder_state["last_uid"] = max_uid
         folder_state["last_poll"] = datetime.now(timezone.utc).isoformat()
 
     def _process_message(

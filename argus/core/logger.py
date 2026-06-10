@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,9 @@ class ArgusLogger:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # Audit fix: read-prev-hash-then-insert is a TOCTOU race — two threads
+        # writing concurrently fork the hash chain. All public methods lock.
+        self._lock = threading.Lock()
         self._init_schema()
         log.info("ArgusLogger initialised at %s", db_path)
 
@@ -119,109 +123,127 @@ class ArgusLogger:
         timestamp = now.isoformat()
         date = now.strftime("%Y-%m-%d")
 
-        prev_hash = self._latest_chain_hash()
-        chain_hash = self._compute_hash(prev_hash, incident_id, timestamp, verdict)
+        # Lock spans hash-read + insert: concurrent writers would otherwise
+        # read the same prev_hash and fork the chain (verify_chain would fail).
+        with self._lock:
+            prev_hash = self._latest_chain_hash()
+            chain_hash = self._compute_hash(prev_hash, incident_id, timestamp, verdict)
 
-        self._conn.execute(
-            """
-            INSERT INTO incidents (
-                incident_id, timestamp, date, monitor_type,
-                input_summary, features, rag_matches,
-                model_used, model_version, reasoning,
-                verdict, confidence, action_taken,
-                chain_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                incident_id, timestamp, date, monitor_type,
-                input_summary,
-                json.dumps(features) if features else None,
-                json.dumps(rag_matches) if rag_matches else None,
-                model_used, model_version, reasoning,
-                verdict, confidence, action_taken,
-                chain_hash,
-            ),
-        )
-        self._conn.commit()
+            self._conn.execute(
+                """
+                INSERT INTO incidents (
+                    incident_id, timestamp, date, monitor_type,
+                    input_summary, features, rag_matches,
+                    model_used, model_version, reasoning,
+                    verdict, confidence, action_taken,
+                    chain_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    incident_id, timestamp, date, monitor_type,
+                    input_summary,
+                    json.dumps(features) if features else None,
+                    json.dumps(rag_matches) if rag_matches else None,
+                    model_used, model_version, reasoning,
+                    verdict, confidence, action_taken,
+                    chain_hash,
+                ),
+            )
+            self._conn.commit()
 
-        # Keep daily_stats in sync
-        self._upsert_daily_stats(date, verdict)
+            # Keep daily_stats in sync (inside lock — same connection)
+            self._upsert_daily_stats(date, verdict)
 
         log.info("[%s] %s — %s (id=%s)", monitor_type, verdict, input_summary[:80], incident_id)
         return incident_id
 
     def mark_user_confirmed(self, incident_id: str, confirmed: bool) -> None:
         """Record whether the user confirmed a threat or dismissed it as a false positive."""
-        self._conn.execute(
-            """
-            UPDATE incidents
-               SET user_confirmed = ?,
-                   false_positive = ?
-             WHERE incident_id = ?
-            """,
-            (1 if confirmed else 0, 0 if confirmed else 1, incident_id),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE incidents
+                   SET user_confirmed = ?,
+                       false_positive = ?
+                 WHERE incident_id = ?
+                """,
+                (1 if confirmed else 0, 0 if confirmed else 1, incident_id),
+            )
+            self._conn.commit()
 
     def mark_synced(self, incident_id: str, *, bigquery: bool = False, gcs: bool = False) -> None:
         """Set cloud-sync flags after successful upload."""
-        self._conn.execute(
-            """
-            UPDATE incidents
-               SET synced_bigquery = CASE WHEN ? THEN 1 ELSE synced_bigquery END,
-                   synced_gcs      = CASE WHEN ? THEN 1 ELSE synced_gcs END
-             WHERE incident_id = ?
-            """,
-            (bigquery, gcs, incident_id),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE incidents
+                   SET synced_bigquery = CASE WHEN ? THEN 1 ELSE synced_bigquery END,
+                       synced_gcs      = CASE WHEN ? THEN 1 ELSE synced_gcs END
+                 WHERE incident_id = ?
+                """,
+                (bigquery, gcs, incident_id),
+            )
+            self._conn.commit()
 
     def mark_training_exported(self, incident_id: str) -> None:
         """Flag a row as included in a training data export."""
-        self._conn.execute(
-            "UPDATE incidents SET training_exported = 1 WHERE incident_id = ?",
-            (incident_id,),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE incidents SET training_exported = 1 WHERE incident_id = ?",
+                (incident_id,),
+            )
+            self._conn.commit()
 
     # ------------------------------------------------------------------
     # Public read API
     # ------------------------------------------------------------------
 
     def get_incident(self, incident_id: str) -> dict | None:
-        row = self._conn.execute(
-            "SELECT * FROM incidents WHERE incident_id = ?", (incident_id,)
-        ).fetchone()
+        """Return one incident row as a dict, or None if not found."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM incidents WHERE incident_id = ?", (incident_id,)
+            ).fetchone()
         return dict(row) if row else None
 
     def get_recent(self, limit: int = 50) -> list[dict]:
-        rows = self._conn.execute(
-            "SELECT * FROM incidents ORDER BY rowid DESC LIMIT ?", (limit,)
-        ).fetchall()
+        """Return the most recent incidents, newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM incidents ORDER BY rowid DESC LIMIT ?", (limit,)
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def get_unsynced(self) -> list[dict]:
         """Return rows not yet pushed to BigQuery."""
-        rows = self._conn.execute(
-            "SELECT * FROM incidents WHERE synced_bigquery = 0 ORDER BY rowid"
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM incidents WHERE synced_bigquery = 0 ORDER BY rowid"
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def get_unreviewed_threats(self) -> list[dict]:
-        rows = self._conn.execute(
-            """
-            SELECT * FROM incidents
-             WHERE verdict IN ('SUSPICIOUS', 'UNCERTAIN')
-               AND user_confirmed IS NULL
-             ORDER BY rowid DESC
-            """
-        ).fetchall()
+        """Return threat verdicts awaiting user review (drives the red tray icon)."""
+        # Audit fix: QUARANTINED and HUMAN_DECISION_REQUIRED were missing —
+        # the verdicts that most need review never appeared in this list.
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM incidents
+                 WHERE verdict IN ('SUSPICIOUS', 'UNCERTAIN',
+                                   'QUARANTINED', 'HUMAN_DECISION_REQUIRED')
+                   AND user_confirmed IS NULL
+                 ORDER BY rowid DESC
+                """
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def get_daily_stats(self, date: str) -> dict | None:
-        row = self._conn.execute(
-            "SELECT * FROM daily_stats WHERE date = ?", (date,)
-        ).fetchone()
+        """Return the daily_stats row for a YYYY-MM-DD date, or None."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM daily_stats WHERE date = ?", (date,)
+            ).fetchone()
         return dict(row) if row else None
 
     # ------------------------------------------------------------------
@@ -233,9 +255,10 @@ class ArgusLogger:
         Walk every row in insertion order and recompute the hash chain.
         Returns (True, "ok") if intact, or (False, "broken at incident_id=X") if tampered.
         """
-        rows = self._conn.execute(
-            "SELECT incident_id, timestamp, verdict, chain_hash FROM incidents ORDER BY rowid"
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT incident_id, timestamp, verdict, chain_hash FROM incidents ORDER BY rowid"
+            ).fetchall()
 
         prev_hash = _GENESIS_HASH
         for row in rows:
@@ -260,7 +283,9 @@ class ArgusLogger:
         self._conn.execute(
             "UPDATE daily_stats SET total_events = total_events + 1 WHERE date = ?", (date,)
         )
-        if verdict in ("SUSPICIOUS", "UNCERTAIN"):
+        # Audit fix: gate verdicts QUARANTINED / HUMAN_DECISION_REQUIRED are threats
+        # too — Defender-confirmed malware was not counted before.
+        if verdict in ("SUSPICIOUS", "UNCERTAIN", "QUARANTINED", "HUMAN_DECISION_REQUIRED"):
             self._conn.execute(
                 "UPDATE daily_stats SET threats_detected = threats_detected + 1 WHERE date = ?",
                 (date,),
@@ -268,7 +293,9 @@ class ArgusLogger:
         self._conn.commit()
 
     def close(self) -> None:
-        self._conn.close()
+        """Close the DB connection. Lock ensures no in-flight write is severed."""
+        with self._lock:
+            self._conn.close()
 
 
 # ------------------------------------------------------------------

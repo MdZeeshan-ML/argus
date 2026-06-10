@@ -44,7 +44,9 @@ _CLEAR_CONFIDENCE_THRESHOLD = 0.85
 
 # How long to wait for a file's size to stabilize (still being written)
 _STABILITY_POLL_INTERVAL = 0.5   # seconds between size checks
-_STABILITY_MAX_WAIT = 10.0       # maximum seconds to wait for stabilization
+# Audit fix: 10s was shorter than many real downloads; an unstable file was
+# then treated as stable and analyzed mid-write (partial hash, partial scan).
+_STABILITY_MAX_WAIT = 60.0       # maximum seconds to wait for stabilization
 
 # Extensions handled by Windows Sandbox dynamic analysis (Gate 3)
 # Anything not here but in GATE3_EXTENSIONS → HUMAN_DECISION_REQUIRED
@@ -128,17 +130,27 @@ class GateKeeper:
         path = Path(event["path"])
         log.info("GateKeeper: processing %s", path.name)
 
-        # Wait for the file to finish writing before scanning
-        if not self._wait_for_stable(path):
-            log.warning("GateKeeper: file vanished or never stabilised: %s", path.name)
-            return GateResult(
+        # Wait for the file to finish writing before scanning.
+        # Audit fix: both failure paths now log an incident — previously these
+        # returned without any SQLite record (silent gap in the audit trail).
+        stability = self._wait_for_stable(path)
+        if stability == "vanished":
+            return self._finalize(
                 path=path,
                 verdict="UNANALYZED",
                 gate_reached=0,
-                features={},
-                incident_id="",
-                reason="File disappeared before analysis could complete",
+                features={"file_name": path.name},
+                reason="File disappeared before analysis could complete (deleted, or removed by Defender real-time protection)",
                 action_taken="NONE",
+            )
+        if stability == "unstable":
+            return self._finalize(
+                path=path,
+                verdict="UNANALYZED",
+                gate_reached=0,
+                features={"file_name": path.name},
+                reason=f"File still being written after {_STABILITY_MAX_WAIT:.0f}s — held in staging zone (execute denied)",
+                action_taken="HOLD_UNANALYZED",
             )
 
         # -- Gate 1: Windows Defender ------------------------------------------
@@ -190,6 +202,11 @@ class GateKeeper:
 
         # -- Gate 2: Static analysis --------------------------------------------
         gate2_verdict, gate2_confidence = self._gate2_static(path, features)
+        # Audit fix: _finalize reads this key for the SQLite confidence column —
+        # it was never set, so every gate incident logged confidence=NULL.
+        features["_gate2_confidence"] = gate2_confidence
+        # Confidence may be None (Phase 2 inference without a score) — never crash on format
+        conf_s = f"{gate2_confidence:.2f}" if gate2_confidence is not None else "n/a"
 
         if gate2_verdict == "SUSPICIOUS":
             return self._finalize(
@@ -197,7 +214,7 @@ class GateKeeper:
                 verdict="QUARANTINED",
                 gate_reached=2,
                 features=features,
-                reason=f"Static analysis: SUSPICIOUS (confidence={gate2_confidence:.2f})",
+                reason=f"Static analysis: SUSPICIOUS (confidence={conf_s})",
                 action_taken="MOVE_TO_QUARANTINE",
             )
 
@@ -209,7 +226,7 @@ class GateKeeper:
                     verdict="CLEARED",
                     gate_reached=2,
                     features=features,
-                    reason=f"Static analysis: CLEAN (confidence={gate2_confidence:.2f})",
+                    reason=f"Static analysis: CLEAN (confidence={conf_s})",
                     action_taken="MOVE_TO_CLEARED",
                 )
 
@@ -305,8 +322,12 @@ class GateKeeper:
                         "total_engines": total,
                         "sha256": sha256,
                     }
+                # Audit fix: suspicious_engines was dropped from the CLEAN payload —
+                # a file 20 engines call suspicious looked identical to a true clean
+                # in features, which would mislead Phase 2 inference toward CLEAN.
                 return "CLEAN", {
                     "malicious_engines": 0,
+                    "suspicious_engines": suspicious,
                     "total_engines": total,
                     "sha256": sha256,
                 }
@@ -515,6 +536,12 @@ class GateKeeper:
             final_path = self._move_to_quarantine(path)
         # HOLD_* actions leave file in staging zone — ACL prevents execution
 
+        # Audit fix: a failed move must not be logged as if it succeeded —
+        # the record claimed containment while the file was still in staging.
+        if action_taken in ("MOVE_TO_CLEARED", "MOVE_TO_QUARANTINE") and final_path is None:
+            action_taken = f"{action_taken}_FAILED"
+            reason += " | MOVE FAILED — file remains in staging zone (execute denied by ACL)"
+
         # Log incident — SQLite write happens before any notification
         incident_id = ""
         if self._logger:
@@ -526,6 +553,9 @@ class GateKeeper:
                     features=features,
                     action_taken=action_taken,
                     confidence=features.get("_gate2_confidence"),
+                    # Audit fix: the WHY of every gate decision was never persisted —
+                    # only the rotating log file had it. Goes to the local-only column.
+                    reasoning=reason,
                 )
             except Exception:
                 log.exception("GateKeeper: failed to log incident for %s", path.name)
@@ -559,6 +589,10 @@ class GateKeeper:
             dest = self.cleared_dir / f"{stem}_{int(time.time())}{suffix}"
         try:
             shutil.move(str(path), str(dest))
+            # Audit fix: an NTFS same-volume move keeps the source DACL, so the
+            # file still carried the staging deny-X ACE. /reset re-inherits from
+            # Cleared/ (which has no deny) — the file becomes normally usable.
+            self._icacls(dest, "/reset")
             log.info("GateKeeper: moved to Cleared/: %s", dest.name)
             return dest
         except OSError as e:
@@ -572,6 +606,12 @@ class GateKeeper:
             dest = self.quarantine_dir / f"{path.stem}_{int(time.time())}{path.suffix}"
         try:
             shutil.move(str(path), str(dest))
+            # Audit fix: belt-and-braces — explicitly deny execute on the
+            # quarantined file itself (moved files keep their old DACL).
+            try:
+                self._icacls(dest, "/deny", f"{getpass.getuser()}:(X)")
+            except Exception:
+                log.warning("GateKeeper: per-file quarantine ACL failed for %s", dest.name)
             log.info("GateKeeper: QUARANTINED: %s → %s", path.name, dest)
             return dest
         except OSError as e:
@@ -591,32 +631,50 @@ class GateKeeper:
         """
         try:
             username = getpass.getuser()
-            result = subprocess.run(
-                [
-                    "icacls",
-                    str(self.staging_dir),
-                    "/deny",
-                    f"{username}:(OI)(CI)(X)",  # OI=object inherit, CI=container inherit
-                ],
-                capture_output=True, text=True, timeout=15,
-            )
-            if result.returncode == 0:
+
+            # Remove any stale deny first — repeated /deny calls stack duplicate ACEs
+            self._icacls(self.staging_dir, "/remove:d", username)
+            if self._icacls(self.staging_dir, "/deny", f"{username}:(OI)(CI)(X)"):
                 log.info("GateKeeper: staging zone ACL set — deny execute for %s in %s",
                          username, self.staging_dir)
-            else:
-                log.warning("GateKeeper: icacls failed (code %d): %s",
-                            result.returncode, result.stderr.strip())
+
+            # Audit fix: Cleared/ lives INSIDE Downloads, so (OI)(CI) inheritance
+            # propagated the deny-X onto it — "cleared" files could never run,
+            # silently breaking the pipeline's core promise. Break inheritance
+            # (keeping copies of inherited ACEs), then strip the deny.
+            self._icacls(self.cleared_dir, "/inheritance:d")
+            self._icacls(self.cleared_dir, "/remove:d", username)
+
+            # Audit fix: quarantine had NORMAL permissions — a quarantined
+            # executable was one double-click from running. Deny execute there too.
+            self._icacls(self.quarantine_dir, "/remove:d", username)
+            self._icacls(self.quarantine_dir, "/deny", f"{username}:(OI)(CI)(X)")
         except Exception as e:
             log.warning("GateKeeper: ACL setup failed (non-fatal): %s", e)
+
+    def _icacls(self, target: Path, *args: str) -> bool:
+        """Run one icacls command best-effort. Returns True on exit code 0."""
+        try:
+            result = subprocess.run(
+                ["icacls", str(target), *args],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode != 0:
+                log.warning("GateKeeper: icacls %s %s failed (code %d): %s",
+                            target, " ".join(args), result.returncode, result.stderr.strip())
+            return result.returncode == 0
+        except Exception as e:
+            log.warning("GateKeeper: icacls %s failed: %s", target, e)
+            return False
 
     # ------------------------------------------------------------------
     # File stability check
     # ------------------------------------------------------------------
 
-    def _wait_for_stable(self, path: Path, max_wait: float = _STABILITY_MAX_WAIT) -> bool:
+    def _wait_for_stable(self, path: Path, max_wait: float = _STABILITY_MAX_WAIT) -> str:
         """
         Wait until the file size stops changing (download finished writing).
-        Returns False if file disappears or never stabilises within max_wait.
+        Returns "stable", "vanished" (file gone), or "unstable" (still growing).
         """
         deadline = time.monotonic() + max_wait
         prev_size = -1
@@ -625,19 +683,22 @@ class GateKeeper:
             try:
                 size = path.stat().st_size
             except OSError:
-                return False  # file gone
+                return "vanished"  # file gone
 
             if size == prev_size and size > 0:
-                return True   # stable, non-empty
+                return "stable"   # stable, non-empty
 
             prev_size = size
             time.sleep(_STABILITY_POLL_INTERVAL)
 
-        # Give it one final check
+        # Audit fix: previously returned True here if size > 0 — a file still
+        # being written was analyzed on partial content (wrong hash, wrong scan,
+        # and in Phase 2 a possible CLEAN verdict for bytes that don't exist yet).
         try:
-            return path.stat().st_size > 0
+            path.stat()
+            return "unstable"
         except OSError:
-            return False
+            return "vanished"
 
 
 # ------------------------------------------------------------------
