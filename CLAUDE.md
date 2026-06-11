@@ -77,48 +77,52 @@ one is verified working. Check HANDOFF.md for current position.
 5. `argus/core/daemon.py` ✅ — main event loop: staged events → gate_keeper; desktop events → extractor → inference
 6. Manual test: trigger a fake suspicious file, verify SQLite log entry
 
-### Phase 2 — Inference Layer
-7. `argus/analysis/inference/local.py` — Ollama client (OpenAI-compatible)
-8. `argus/analysis/inference/cloud.py` — NIM client (OpenAI-compatible)
-9. `argus/analysis/inference/router.py` — mode switch logic + fallback
-10. `argus/analysis/inference/consensus.py` — multi-run voting for uncertain cases
-11. Integration test: file trigger → feature extraction → inference → log verdict
+### Phase 2 — Inference Layer (neuro-symbolic, three-tier)
+7.  `argus/analysis/inference/classifier.py` — XGBoost/MLP fast path; cold-start = heuristic_verdict() stub; trained model slots in at Phase 8
+8.  `argus/analysis/inference/local.py` — Ollama client (qwen3:1.7b); called ONLY when classifier uncertain (0.1–0.9)
+9.  `argus/analysis/inference/cloud.py` — NIM/Kimi K2 client; escalation from local LLM + on-demand explanation calls from GUI
+10. `argus/analysis/inference/router.py` — three-tier routing: symbolic hard rules → classifier fast path → local LLM → cloud escalation
+11. `argus/analysis/inference/explainer.py` — JSON verdict → human-readable prose; ON DEMAND from GUI only, never at verdict time
+12. Integration test: classifier fast path → verdict to SQLite; uncertain path → local LLM → verdict; explainer renders on demand
+    NOTE: `consensus.py` (multi-run voting) deferred to Phase 8 — single-pass is correct for Phase 2.
+    Entry requirement (from Phase 1 audit): router.py must sanitize all attacker-controlled feature
+    strings and set `injection_attempt_detected` before any prompt is built.
 
 ### Phase 3 — RAG Layer
-12. `argus/analysis/rag/embedder.py` — ChromaDB + sentence-transformers setup
-13. `argus/analysis/rag/threat_feeds.py` — API ingestion: URLhaus, MalwareBazaar,
+13. `argus/analysis/rag/embedder.py` — ChromaDB + sentence-transformers setup
+14. `argus/analysis/rag/threat_feeds.py` — API ingestion: URLhaus, MalwareBazaar,
     OpenPhish, AbuseIPDB, Emerging Threats (no manual downloads — all via API)
-14. `argus/analysis/rag/whitelist.py` — personal known-good loader from private config
-15. Wire RAG into inference: retrieved context injected into prompt before LLM call
+15. `argus/analysis/rag/whitelist.py` — personal known-good loader from private config
+16. Wire RAG into inference: retrieved context injected into prompt before LLM call
 
 ### Phase 4 — Response + Tray
-16. `argus/response/notifier.py` — Windows toast notifications via plyer
-17. `argus/response/quarantine.py` — auto-move suspicious files to quarantine dir
-18. `argus/tray/tray_app.py` — pystray system tray icon with right-click menu
-19. `launch_argus.vbs` — invisible background launch script
-20. Startup shortcut via shell:startup
+17. `argus/response/notifier.py` — Windows toast notifications via plyer
+18. `argus/response/quarantine.py` — auto-move suspicious files to quarantine dir
+19. `argus/tray/tray_app.py` — pystray system tray icon with right-click menu
+20. `launch_argus.vbs` — invisible background launch script
+21. Startup shortcut via shell:startup
 
 ### Phase 5 — Additional Monitors
-21. `argus/monitors/package_monitor.py` — pip/npm install watcher + typosquat detection
-22. `argus/monitors/browser_monitor.py` — Chrome/Firefox extension directory watcher
-23. `argus/monitors/clipboard_monitor.py` — UPI/payment address verification
+22. `argus/monitors/package_monitor.py` — pip/npm install watcher + typosquat detection
+23. `argus/monitors/browser_monitor.py` — Chrome/Firefox extension directory watcher
+24. `argus/monitors/clipboard_monitor.py` — UPI/payment address verification
 
 ### Phase 6 — GUI
-24. `argus/api/server.py` — FastAPI local server (localhost:7734) serving incident data
-25. `argus/gui/frontend/` — HTML/CSS/JS frontend (three views: Dashboard, Detail, Settings)
-26. `argus/tray/tray_app.py` — update to open PyWebView window on click
+25. `argus/api/server.py` — FastAPI local server (localhost:7734) serving incident data
+26. `argus/gui/frontend/` — HTML/CSS/JS frontend (three views: Dashboard, Detail, Settings)
+27. `argus/tray/tray_app.py` — update to open PyWebView window on click
 
 ### Phase 7 — Cloud Sync
-27. `argus/cloud/bigquery_client.py` — streaming insert of incidents
-28. `argus/cloud/gcs_client.py` — hourly log rotation + upload
-29. `argus/cloud/drive_client.py` — daily PDF report generator + Drive upload
-30. `argus/cloud/report_generator.py` — weasyprint PDF report from daily SQLite query
+28. `argus/cloud/bigquery_client.py` — streaming insert of incidents
+29. `argus/cloud/gcs_client.py` — hourly log rotation + upload
+30. `argus/cloud/drive_client.py` — daily PDF report generator + Drive upload
+31. `argus/cloud/report_generator.py` — weasyprint PDF report from daily SQLite query
 
-### Phase 8 — Training Pipeline (After 3+ months of data)
-31. `training/data_export.py` — SQLite → HuggingFace dataset format
-32. `training/synthetic_gen.py` — Kimi K2 synthetic data generator
-33. `training/kaggle_finetune.ipynb` — QLoRA fine-tuning notebook for Kaggle
-34. `training/evaluate.py` — model evaluation script
+### Phase 8 — Training Pipeline (After 3+ months of labeled data)
+32. `training/data_export.py` — SQLite → HuggingFace dataset format (feature dict → MITRE-tagged verdict + reasoning traces)
+33. `training/synthetic_gen.py` — Kimi K2 as teacher: synthetic reasoning traces from real feature dicts + VT/MalwareBazaar labels
+34. `training/kaggle_finetune.ipynb` — QLoRA + unsloth on Kaggle T4 (free); base: phi-3-mini (3.8B); output = LoRA adapter (50–200MB), retrain monthly
+35. `training/evaluate.py` — model evaluation script
 
 ---
 
@@ -150,10 +154,12 @@ Short commands → exact file targets:
 - "build the scanner" → `argus/monitors/email_scanner.py`
 - "build the extractor" → `argus/analysis/feature_extractor.py`
 - "wire the daemon" → `argus/core/daemon.py`
+- "build the classifier" → `argus/analysis/inference/classifier.py`
 - "build local inference" → `argus/analysis/inference/local.py`
 - "build cloud inference" → `argus/analysis/inference/cloud.py`
 - "build the router" → `argus/analysis/inference/router.py`
-- "build consensus" → `argus/analysis/inference/consensus.py`
+- "build the explainer" → `argus/analysis/inference/explainer.py`
+- "build consensus" → `argus/analysis/inference/consensus.py` (deferred to Phase 8)
 - "build the embedder" → `argus/analysis/rag/embedder.py`
 - "build threat feeds" → `argus/analysis/rag/threat_feeds.py`
 - "build the notifier" → `argus/response/notifier.py`
@@ -186,17 +192,19 @@ deterministic. Never dispatch silently — say what you're delegating and why.
 File lands in ~/Downloads (ACL: deny-execute) →
 Gate 1: Windows Defender (MpCmdRun.exe, 60s) →
 Gate 1.5: VirusTotal SHA-256 lookup (optional, httpx) →
-Gate 2: Feature extraction + RAG context + LLM inference →
+Gate 2: Feature extraction + RAG context + three-tier inference →
 Gate 3: Dynamic sandbox OR HUMAN_DECISION_REQUIRED →
 CLEARED → ~/Downloads/Cleared/ (normal permissions)
 QUARANTINED → ~/.argus/quarantine/
 ```
 
-**Desktop / email pipeline (original):**
+**Desktop / email pipeline:**
 ```
 Event trigger → Feature extraction → RAG context retrieval →
-LLM inference (local or cloud) → Verdict → SQLite log →
+Three-tier inference (symbolic rules → classifier fast path → LLM if uncertain) →
+Verdict → SQLite log (immediate, structured JSON) →
 [notify user] [quarantine if needed] [cloud sync async]
+[on-demand: explainer.py → human-readable prose for GUI]
 ```
 
 **Routing in daemon:**
@@ -222,8 +230,9 @@ LLM inference (local or cloud) → Verdict → SQLite log →
 ### Offline Resilience
 - SQLite is always written first, synchronously, before anything else
 - Cloud sync is async, best-effort, non-blocking
-- If NIM is unreachable, automatically fall back to local Ollama
-- If Ollama is not running, log incident as UNANALYZED and notify user
+- Classifier (symbolic + fast path) always runs offline — no network required
+- If Ollama is not running, classifier verdict stands (UNANALYZED only if classifier also fails)
+- If NIM is unreachable, local Ollama handles uncertain cases; cloud explanation deferred
 - Daemon must never crash due to network failure
 
 ### Threading Model
@@ -233,6 +242,109 @@ LLM inference (local or cloud) → Verdict → SQLite log →
 - Thread 3: cloud sync queue processor
 - Use `threading.Thread(daemon=True)` for all background threads
 - Use `queue.Queue()` for inter-thread communication — no shared mutable state
+
+---
+
+## Inference Architecture — Three-Tier Neuro-Symbolic
+
+The inference layer is neuro-symbolic. Symbolic constraints bound what the
+neural layer can conclude — this IS the anti-hallucination mechanism.
+
+### Routing Logic
+
+```
+features →
+  symbolic hard rules (MITRE ATT&CK graph, heuristic scoring, Defender/VT gate results)
+    hard rule fires → symbolic verdict WINS, overrides any neural output
+  ↓
+  classifier (XGBoost/MLP fast path)
+    prob > 0.9  → SUSPICIOUS, verdict locked, NO LLM call
+    prob < 0.1  → CLEAN, verdict locked, NO LLM call
+    0.1–0.9     → local LLM (qwen3:1.7b)
+                    LLM uncertain → cloud escalation (Kimi K2 via NIM)
+```
+
+- **Symbolic layer (deterministic, cannot hallucinate):** MITRE ATT&CK graph
+  (networkx), hard rules engine, heuristic scoring, Defender/VT gate results.
+- **Neural layer:** classifier (fast) + local LLM (reasoning in uncertain zone).
+
+### LLM Is a Rendering Layer, Not a Decision Layer
+
+Security verdict = classifier + symbolic rules → SQLite IMMEDIATELY as
+structured JSON. Human-readable explanation = `explainer.py`, called ON DEMAND
+when a human opens the incident in the GUI — never at verdict time.
+
+- Route cloud preferentially for explanation (faster generation; only metadata
+  sent, never file bytes or email body).
+
+### classifier.py / heuristic_verdict() Relationship
+
+`heuristic_verdict()` in gate_keeper.py is the cold-start fallback only.
+classifier.py wraps it:
+- No trained model file present → run heuristics (Phase 2 baseline).
+- Trained model present → model takes priority (Phase 8 onwards).
+Same graceful-degradation pattern as the rest of the system.
+
+### Small Model Capability Boundary — Do Not Violate
+
+10–100M param models = classifier/embedder ONLY. They CANNOT reason, generate
+useful prose, or handle novel attacks. Reasoning + explanation REQUIRE the
+1.7B+ LLM tier. Do not let any future plan collapse the LLM tier into a small
+model. Generalization to novel attacks comes from MITRE graph reasoning +
+anomaly scoring + hard rules — NOT from training on more samples (novel =
+absent from training data by definition).
+
+---
+
+## Dynamic Sandbox Architecture (Gate 3)
+
+Gate 3 uses a tiered approach selected by OS capability at startup. All tiers
+MUST emit the same behavioral report schema — downstream analysis is
+sandbox-agnostic.
+
+### Tier Selection
+
+| Environment | Tier | Technology |
+|---|---|---|
+| Windows 11 Pro (Hyper-V available) | Tier 1 | Windows Sandbox (.wsb config generated by ARGUS) |
+| Linux | Tier 1 | KVM + firejail/namespaces + INetSim |
+| Windows 11 Home (no Hyper-V) | Tier 2 fallback | speakeasy-emulator (pure-Python Win API emulation) |
+
+- **Windows Sandbox:** ARGUS generates `.wsb` config programmatically, launches
+  sandbox, reads behavioral output from a mapped shared folder. Sandbox
+  self-destructs on close — zero state survives between runs.
+- **Speakeasy:** No Hyper-V required. <100ms. Logs all API calls. Catches commodity
+  malware; misses anti-emulation tricks. This is known and acceptable.
+
+### Ghost Filesystem
+
+Sandbox is populated with hollow bait files — realistic names/extensions/paths,
+zero content (passwords.txt, bank_statement.pdf, credential stores). Malware
+reveals behavior by what it TRIES to do; encryption/read/exfil calls happen
+regardless of file content, so no real data is exposed.
+
+- Built ONCE at daemon startup (static dir), mapped into every sandbox run.
+- Do NOT rebuild per-file — wastes 2–3s per analysis.
+- Speakeasy tier: ghost FS simulated in Python, no real hollow files needed.
+
+### Network Interception
+
+**FakeNet-NG is bundled with the ARGUS distribution** — not a user-install
+dependency. Captures DNS queries, HTTP(S) requests, raw TCP/UDP, timing and
+volume. INetSim is the Linux-tier equivalent.
+
+### Behavioral Analysis Stack
+
+Raw packets → feature extraction → structured behavioral report → analysis.
+The neural component on the packet layer is small/statistical only — NOT a
+large model:
+
+- **Rule engine:** DNS exfil detection, DGA patterns, C2 port patterns (0 params).
+- **Threat intel lookups:** AbuseIPDB, URLhaus (deterministic, symbolic).
+- **Statistical anomaly:** Isolation Forest on flow features.
+- **Small sequence model (10–50M params, 1D-CNN/LSTM):** API-call + flow patterns.
+
+LLM reasoning happens on the behavioral REPORT summary, never on raw packets.
 
 ---
 
@@ -258,6 +370,13 @@ LLM inference (local or cloud) → Verdict → SQLite log →
 | Auth | google-auth, python-dotenv | latest |
 | DB | sqlite3 (stdlib) | — |
 | Packaging | pyproject.toml | — |
+| MITRE ATT&CK graph | networkx | latest |
+| Classifier | scikit-learn (MLP) + xgboost | latest |
+| Behavioral anomaly | scikit-learn (Isolation Forest) | latest |
+| Small sequence model | pytorch (1D-CNN/LSTM, 10–50M params) | latest |
+| Dynamic sandbox (Win11 Pro) | Windows Sandbox built-in (.wsb config generated by ARGUS) | — |
+| Dynamic sandbox (Win11 Home fallback) | speakeasy-emulator | latest |
+| Network interception | FakeNet-NG (bundled, not a user-install dep) | — |
 
 **DO NOT use:** tkinter, PyQt, PySide, customtkinter, Flask (use FastAPI),
 requests (use httpx for async), any GUI framework other than PyWebView+HTML.
@@ -413,6 +532,30 @@ If two parts of this document or the codebase conflict, flag inline:
 
 ---
 
+## Known Architectural Debt
+
+These are deliberate tradeoffs, not bugs. Do not fix without explicit instruction.
+
+### logger.py
+
+- **Write bottleneck:** Single lock + single SQLite connection. Fine through Phase 8
+  (single event processor thread). Revisit Phase 9 with connection pool if needed.
+- **Partial chain coverage:** `chain_hash` covers only `incident_id`, `timestamp`,
+  `verdict`, and `chain_hash` itself — NOT `features`, `reasoning`, `confidence`,
+  or `action_taken`. Editing those columns is undetectable by `verify_chain()`.
+  Deliberate tradeoff (performance vs. coverage); document in threat_model.md.
+- **JSON blobs not SQL-queryable:** `features` and `rag_matches` are stored as JSON
+  strings. Phase 8 export must parse them in Python. Consider SQLite JSON extension
+  if analytical queries become needed.
+- **Startup-only chain verification:** `verify_chain()` runs at daemon startup only.
+  In-session tamper + restore before shutdown evades detection. A background verify
+  thread would close this window at additional CPU cost.
+- **daily_stats desync risk:** A crash between the `incidents` INSERT and the counter
+  update leaves `daily_stats` stale. Correct fix = SQLite trigger (atomic with INSERT),
+  not Python. Not worth fixing until Phase 8 when daily_stats feeds the GUI dashboard.
+
+---
+
 ## Hard Rules
 
 1. **Read HANDOFF.md before every session** — no exceptions
@@ -514,19 +657,24 @@ argus/                           <- repo root
 │   │   └── clipboard_monitor.py
 │   ├── analysis/
 │   │   ├── feature_extractor.py ✅ built — hash, magic, entropy, PE, WHOIS, Zone.Identifier
-│   │   ├── dynamic/             <- Gate 3 sandbox modules (Phase 3)
-│   │   │   ├── sandbox_python.py
-│   │   │   ├── sandbox_node.py
-│   │   │   └── process_monitor.py
+│   │   ├── dynamic/             <- Gate 3 sandbox modules
+│   │   │   ├── sandbox_windows.py     <- Windows Sandbox tier (.wsb config)
+│   │   │   ├── sandbox_speakeasy.py   <- Speakeasy emulator fallback (Win11 Home)
+│   │   │   ├── sandbox_kvm.py         <- Linux KVM tier
+│   │   │   ├── ghost_filesystem.py    <- hollow bait files, built once at startup
+│   │   │   ├── behavioral_analyzer.py <- rule engine + Isolation Forest on report
+│   │   │   └── process_monitor.py     <- behavioral report parser
 │   │   ├── rag/
 │   │   │   ├── embedder.py
 │   │   │   ├── threat_feeds.py
 │   │   │   └── whitelist.py
 │   │   └── inference/
-│   │       ├── router.py
+│   │       ├── classifier.py
 │   │       ├── local.py
 │   │       ├── cloud.py
-│   │       └── consensus.py
+│   │       ├── router.py
+│   │       ├── explainer.py
+│   │       └── consensus.py  <- deferred to Phase 8
 │   ├── response/
 │   │   ├── notifier.py
 │   │   └── quarantine.py
