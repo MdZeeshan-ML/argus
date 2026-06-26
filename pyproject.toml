@@ -31,6 +31,7 @@ dependencies = [
     "schedule",
     "dnspython",
     "python-whois",
+    "keyring",
 ]
 
 [project.scripts]

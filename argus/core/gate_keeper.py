@@ -166,6 +166,9 @@ class GateKeeper:
         # -- Gate 1.5: VirusTotal hash lookup -----------------------------------
         # Run feature extraction here so we have the SHA-256 for the VT query
         features = self._extractor.extract(event)
+        # D3: propagate correlation_id injected by daemon when email attachment matched
+        if event.get("correlation_id"):
+            features["correlation_id"] = event["correlation_id"]
         sha256: str = features.get("sha256", "")
         ext: str = features.get("extension", "").lower()
 

@@ -20,6 +20,7 @@ import logging.handlers
 import os
 import queue
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,9 @@ log = logging.getLogger(__name__)
 
 # Startup sweep cap — bounds Defender scan time after long offline periods
 _SWEEP_MAX_FILES = 25
+
+# D3: window within which a downloaded file is linked back to its email incident
+CORRELATION_WINDOW_SECONDS: int = 30 * 60  # 30 minutes
 
 
 # ------------------------------------------------------------------
@@ -162,6 +166,7 @@ def _dispatch(
     extractor: FeatureExtractor,
     logger: ArgusLogger,
     sync_queue: queue.Queue,
+    attachment_correlation_cache: dict | None = None,
 ) -> None:
     """
     Route one event to the appropriate pipeline.
@@ -175,6 +180,17 @@ def _dispatch(
 
     # ----- Downloads staging zone: four-gate pipeline -----
     if source == "file_watcher" and staged:
+        # D3: link file incident back to the email that delivered the attachment
+        if attachment_correlation_cache is not None:
+            filename = Path(event.get("path", "")).name
+            entry = attachment_correlation_cache.get(filename)
+            if entry is not None:
+                corr_id, ts = entry
+                if time.monotonic() - ts <= CORRELATION_WINDOW_SECONDS:
+                    event = dict(event)
+                    event["correlation_id"] = corr_id
+                else:
+                    attachment_correlation_cache.pop(filename, None)
         try:
             result = gate_keeper.process(event)
         except Exception:
@@ -241,6 +257,7 @@ def _event_processor(
     logger: ArgusLogger,
     sync_queue: queue.Queue,
     shutdown_event: threading.Event,
+    attachment_correlation_cache: dict | None = None,
 ) -> None:
     """
     Thread function: reads events from the shared queue and dispatches them.
@@ -261,7 +278,8 @@ def _event_processor(
             continue
 
         try:
-            _dispatch(event, gate_keeper, extractor, logger, sync_queue)
+            _dispatch(event, gate_keeper, extractor, logger, sync_queue,
+                      attachment_correlation_cache)
         except Exception:
             log.exception(
                 "Event processor: unhandled error (source=%s, path=%s)",
@@ -314,6 +332,8 @@ class ArgusDaemon:
         self._shutdown = threading.Event()
         self._event_queue: queue.Queue = queue.Queue()
         self._sync_queue: queue.Queue = queue.Queue()
+        # D3: shared {filename: (correlation_id, monotonic_ts)} linking email and file incidents
+        self._attachment_correlation_cache: dict[str, tuple[str, float]] = {}
 
         # All handles set in start()
         self._logger: ArgusLogger | None = None
@@ -391,6 +411,7 @@ class ArgusDaemon:
                 password=cfg["email_password"],
                 poll_interval_minutes=cfg["email_poll_mins"],
                 state_path=cfg["email_state_path"],
+                attachment_correlation_cache=self._attachment_correlation_cache,
             )
             self._email_scanner.start()
         else:
@@ -408,6 +429,7 @@ class ArgusDaemon:
                 self._logger,
                 self._sync_queue,
                 self._shutdown,
+                self._attachment_correlation_cache,
             ),
             name="event-processor",
             daemon=False,  # non-daemon so it can drain the queue before process exits

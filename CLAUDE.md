@@ -85,13 +85,25 @@ one is verified working. Check HANDOFF.md for current position.
 11. `argus/analysis/inference/explainer.py` — JSON verdict → human-readable prose; ON DEMAND from GUI only, never at verdict time
 12. Integration test: classifier fast path → verdict to SQLite; uncertain path → local LLM → verdict; explainer renders on demand
     NOTE: `consensus.py` (multi-run voting) deferred to Phase 8 — single-pass is correct for Phase 2.
-    Entry requirement (from Phase 1 audit): router.py must sanitize all attacker-controlled feature
-    strings and set `injection_attempt_detected` before any prompt is built.
+    Entry requirements for router.py (F1):
+      (a) Sanitize all attacker-controlled feature strings and set `injection_attempt_detected=True`
+          before any prompt is built.
+      (b) Enforce E3 cloud allowlist — strip query strings from all link URLs before cloud escalation.
+      (c) Gate on `originating_ip_trusted` — untrusted IP never sent to cloud.
 
 ### Phase 3 — RAG Layer
 13. `argus/analysis/rag/embedder.py` — ChromaDB + sentence-transformers setup
 14. `argus/analysis/rag/threat_feeds.py` — API ingestion: URLhaus, MalwareBazaar,
-    OpenPhish, AbuseIPDB, Emerging Threats (no manual downloads — all via API)
+    OpenPhish, AbuseIPDB (no manual downloads — all via API)
+    Must populate TWO stores (F2):
+      Store 1 — Exact-match indicator sets: SHA256/MD5/SHA1 hash set (MalwareBazaar),
+        full-URL set (OpenPhish, URLhaus), IP set (AbuseIPDB). Interface: `exact_intel_load()`
+        in gate_keeper. Query: O(1) set membership. Update cadence from `.env`.
+      Store 2 — ChromaDB semantic index: threat descriptions, behavioral patterns,
+        campaign context. Interface: ChromaDB collection queried by router.py RAG path.
+        Query: similarity search, top-k with scores.
+      Do NOT put exact-match indicators into the embedding index — a set membership
+      test cannot be rationalized away; a similarity score can.
 15. `argus/analysis/rag/whitelist.py` — personal known-good loader from private config
 16. Wire RAG into inference: retrieved context injected into prompt before LLM call
 
@@ -220,12 +232,42 @@ Verdict → SQLite log (immediate, structured JSON) →
 - Cloud sync (BigQuery) gets metadata + verdict + confidence score
   — never the full model reasoning chain for privacy
 
+> **Contradiction (resolved — E3):** privacy boundary enumerates cloud-permitted
+> metadata but no module currently enforces it. `_sensitive_fields` strips subject
+> only. Links were in the features dict with no stripping.
+>
+> **Resolution:** Phase 2 `router.py` owns allowlist enforcement. Canonical
+> cloud-permitted fields:
+>   `filename`, `extension`, `sha256`, `entropy`, `magic_bytes`,
+>   `sender_domain`, `whois_age`, `spf`, `dkim`, `dmarc`, `dkim_aligned`,
+>   `link_domains` (query strings stripped), `any_link_lookalike`,
+>   `any_text_href_mismatch`, `originating_ip` (only when `originating_ip_trusted=True`),
+>   `attachment_manifest` (no bytes)
+>
+> Link query strings are stripped before cloud — unsubscribe and tracking URLs
+> embed user email and session tokens in params. Router strips everything after
+> `?` on all link URLs before cloud. Subject remains `_sensitive` (local only).
+
 ### Credentials — Zero Tolerance for Hardcoding
 - All API keys in `.env` file, loaded via `python-dotenv`
 - `.env` must be in `.gitignore` — already confirmed
 - Google service account JSON at `~/.argus/credentials/service_account.json`
   — outside project directory entirely, never committed
 - Config template at `configs/config.example.json` with placeholder values only
+
+**At-rest protection (email credentials only):**
+Loading from `.env` is sufficient hygiene for API keys (NIM, VirusTotal) —
+low-value and revocable. It is NOT sufficient for the email password. The email
+password grants access to the user's entire mailbox; any user-level process,
+opportunistic malware, or backup sweep can read a plaintext `.env`.
+
+- Email password → OS keyring (Windows Credential Manager / DPAPI) via the
+  `keyring` library. GCP service-account path → OS keyring.
+- Low-value API keys (NIM, VirusTotal) remain in `.env`.
+- On first run: if `EMAIL_PASSWORD` is found in `.env`, migrate it to the keyring
+  and print a one-time instruction to remove it. Do not read it from `.env` on
+  subsequent runs.
+- `keyring` is an approved dependency — added to `pyproject.toml`.
 
 ### Offline Resilience
 - SQLite is always written first, synchronously, before anything else
@@ -276,6 +318,31 @@ when a human opens the incident in the GUI — never at verdict time.
 
 - Route cloud preferentially for explanation (faster generation; only metadata
   sent, never file bytes or email body).
+
+### Threat Intel — Two Channels, Two Data Structures, Two Consumers
+
+> **Contradiction (resolved — E2):** "symbolic verdict WINS, overrides neural"
+> conflicts with routing all threat intel as RAG prompt context. Exact-match
+> intel injected as a similarity score can be rationalized away by the LLM.
+> This violates the override principle.
+
+**Channel 1 — Exact match (hash / full URL / IP):**
+- Data structure: Python sets (hash set, URL set, IP set)
+- Query: O(1) membership test — returns True/False, no score
+- Consumer: `gate_keeper.exact_intel_check()` (symbolic layer)
+- Verdict: locked SUSPICIOUS, LLM never invoked
+- Populated by: Phase 3 `threat_feeds.py` via `exact_intel_load()`
+
+**Channel 2 — Fuzzy / semantic:**
+- Data structure: ChromaDB embedding index
+- Query: similarity search — returns top-k with scores
+- Consumer: LLM prompt context (RAG)
+- Verdict: LLM weighs as evidence, not a locked fact
+- Populated by: Phase 3 `threat_feeds.py` ChromaDB ingestion
+
+Do NOT collapse exact-match indicators into the embedding index. An OpenPhish
+URL stored as an embedding returns a similarity score. A score can be
+rationalized away. A set membership test cannot.
 
 ### classifier.py / heuristic_verdict() Relationship
 
@@ -553,6 +620,36 @@ These are deliberate tradeoffs, not bugs. Do not fix without explicit instructio
 - **daily_stats desync risk:** A crash between the `incidents` INSERT and the counter
   update leaves `daily_stats` stale. Correct fix = SQLite trigger (atomic with INSERT),
   not Python. Not worth fixing until Phase 8 when daily_stats feeds the GUI dashboard.
+
+### email_scanner.py
+
+- **IMAP IDLE not implemented:** Poll interval default 15 min means a phishing
+  email can sit unscanned while the user opens and clicks it. ARGUS warns about
+  a phish the user may have already acted on. Deliberate v1 tradeoff. IDLE is
+  the upgrade path. Document honestly in README and threat model.
+- **OAuth2 not implemented:** Gmail app-password works today. Microsoft Exchange
+  Online is actively deprecating basic IMAP auth. Auth mechanism is pluggable;
+  OAuth2 path needed when provider forces it. Not a today-bug for Gmail.
+- **Process-kill exposure:** Any process running as the same user can kill the
+  daemon. Running as a Windows Service under a separate account closes this but
+  requires an installer with elevation. Target milestone: Phase 6 packaging.
+- **WHOIS cap counts cache hits:** `MAX_LINK_WHOIS` counter increments on every
+  domain, including those already in the LRU cache. Should increment only on
+  cache miss (actual network call). Fix on next `_extract_email` touch.
+- **No per-message part count cap:** A 500-tiny-part email forces ~500 sequential
+  IMAP round trips, stalling the poll thread. Add a named count cap (default 20)
+  alongside the existing size caps.
+
+### Architecture decisions (apply across phases)
+
+- **Per-module CLAUDE.md files:** Root CLAUDE.md contains cross-cutting concerns
+  only. Each module directory gets its own CLAUDE.md with module-specific
+  constraints. No duplication between the two. Phase 1 closure task.
+- **Per-folder README.md:** Every folder answers: what lives here, what problem
+  it solves, what depends on it. Phase 1 closure task.
+- **`/architecture` folder:** One `.md` per major architectural decision
+  (inference routing, neuro-symbolic split, privacy boundary, threat model scope).
+  Sourced from advisory session content. Phase 1 closure task.
 
 ---
 

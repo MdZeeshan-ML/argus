@@ -13,8 +13,11 @@ Privacy rules enforced here:
   - UID state is persisted to ~/.argus/email_state.json. On first run,
     existing emails are skipped — Argus watches new arrivals only.
 
-Attachment downloading and Windows Defender scanning live in the
-quarantine/response layer (Phase 4). This module only extracts metadata.
+Attachment bytes are never fetched by this module. Filename metadata
+(double_extension, dangerous_ext, size_bytes) is recorded from BODYSTRUCTURE.
+When the user downloads an attachment naturally, file_watcher catches it
+in ~/Downloads and the existing gate pipeline runs. Email and file incidents
+are linked via correlation_id.
 """
 
 import contextlib
@@ -31,6 +34,8 @@ import random
 import re
 import tempfile
 import threading
+import time
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -51,6 +56,21 @@ _URL_RE = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
 # Per-part and per-message size caps used by the two-phase IMAP fetch (A5)
 MAX_PART_BYTES = 5 * 1024 * 1024      # 5 MB — skip any single MIME part above this
 MAX_MESSAGE_BYTES = 25 * 1024 * 1024  # 25 MB — stop fetching further parts beyond this total
+
+_DANGEROUS_EXTENSIONS: frozenset[str] = frozenset({
+    ".exe", ".scr", ".bat", ".cmd", ".ps1", ".psd1", ".psm1",
+    ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".msi",
+    ".msp", ".hta", ".lnk", ".iso", ".img", ".dll", ".sys",
+    ".jar", ".reg", ".com", ".pif", ".cpl", ".msc", ".inf",
+})
+
+
+def _double_extension(filename: str) -> bool:
+    """Return True when a dangerous outer extension hides an inner one (invoice.pdf.exe)."""
+    p = Path(filename)
+    if not p.suffix or p.suffix.lower() not in _DANGEROUS_EXTENSIONS:
+        return False
+    return bool(Path(p.stem).suffix)
 
 class _AnchorParser(html.parser.HTMLParser):
     """
@@ -542,6 +562,7 @@ def extract_metadata(
         has_attachments = _injected_attachments["has_attachments"]
         attachment_names = _injected_attachments["attachment_names"]
         attachment_mimes = _injected_attachments["attachment_mimes"]
+        attachment_manifest: list[dict] = _injected_attachments.get("attachment_manifest", [])
         html_only = _injected_attachments["html_only"]
         links = _injected_links if _injected_links is not None else []
     else:
@@ -549,6 +570,7 @@ def extract_metadata(
         # any caller that passes a complete email.Message).
         attachment_names: list[str] = []
         attachment_mimes: list[str] = []
+        attachment_manifest = []
         content_types: set[str] = set()
         has_attachments = False
 
@@ -595,6 +617,9 @@ def extract_metadata(
         "has_attachments": has_attachments,
         "attachment_names": attachment_names,
         "attachment_mimes": attachment_mimes,
+        # D1: per-attachment metadata (filename, declared_mime, size_bytes,
+        # double_extension, dangerous_ext, oversized). No bytes fetched.
+        "attachment_manifest": attachment_manifest,
         "has_external_links": bool(links),
         "links": links,
         "html_only": html_only,
@@ -661,6 +686,7 @@ class EmailScanner:
         state_path: Path | None = None,
         provider_authserv_id: str = "mx.google.com",
         first_run_scan_unread_days: int = 0,
+        attachment_correlation_cache: dict | None = None,
     ) -> None:
         self._queue = event_queue
         self._server = imap_server
@@ -679,6 +705,8 @@ class EmailScanner:
         self._auth_fail_streak = 0
         self._auth_incident_sent = False
         self._stop = threading.Event()
+        # D3: shared dict {filename: (correlation_id, monotonic_ts)} owned by daemon
+        self._attachment_correlation_cache = attachment_correlation_cache
         self._thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------
@@ -980,12 +1008,14 @@ class EmailScanner:
         total_fetched = 0
         seen_ctypes: set[str] = set()
 
+        attachment_manifest: list[dict] = []
+
         for part in bs_parts:
             ctype = f"{part['type']}/{part['subtype']}"
             seen_ctypes.add(ctype)
 
             is_text = part["type"] == "text" and part["subtype"] in ("plain", "html")
-            # Non-text, non-multipart parts are treated as attachments (per Part D hook)
+            # Non-text, non-multipart parts are treated as attachments (D1)
             is_attachment = (
                 part.get("disposition") == "attachment"
                 or (part["type"] not in ("text", "multipart") and part["type"] != "")
@@ -993,9 +1023,19 @@ class EmailScanner:
 
             if is_attachment:
                 has_attachments = True
+                filename = part.get("filename") or f"attachment_part{part['part_num']}"
                 if part.get("filename"):
-                    attachment_names.append(part["filename"])
+                    attachment_names.append(filename)
                 attachment_mimes.append(ctype)
+                ext = Path(filename).suffix.lower()
+                attachment_manifest.append({
+                    "filename": filename,
+                    "declared_mime": ctype,
+                    "size_bytes": part["size"],
+                    "double_extension": _double_extension(filename),
+                    "dangerous_ext": ext in _DANGEROUS_EXTENSIONS,
+                    "oversized": part["size"] > MAX_PART_BYTES,
+                })
                 continue
 
             if not is_text:
@@ -1027,6 +1067,8 @@ class EmailScanner:
         )
         links = _extract_links_from_parts(fetched_text_parts)
 
+        correlation_id = str(uuid.uuid4())
+
         metadata = extract_metadata(
             msg_headers,
             self._provider_authserv_id,
@@ -1035,10 +1077,12 @@ class EmailScanner:
                 "has_attachments": has_attachments,
                 "attachment_names": attachment_names,
                 "attachment_mimes": attachment_mimes,
+                "attachment_manifest": attachment_manifest,
                 "html_only": html_only,
             },
             oversized_part_skipped=oversized_part_skipped,
         )
+        metadata["correlation_id"] = correlation_id
 
         # Build a compact human-readable summary for logging + SQLite input_summary
         sum_parts = [f"from={metadata['from_domain']}"]
@@ -1060,6 +1104,12 @@ class EmailScanner:
             "metadata": metadata,
         }
         self._queue.put(entry)
+
+        # D3: register each attachment filename so daemon can link the file incident
+        if self._attachment_correlation_cache is not None and attachment_manifest:
+            ts = time.monotonic()
+            for att in attachment_manifest:
+                self._attachment_correlation_cache[att["filename"]] = (correlation_id, ts)
 
         log.info(
             "Queued: %s | spf=%s dkim=%s dmarc=%s | subj=%r",
