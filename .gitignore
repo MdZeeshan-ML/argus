@@ -24,6 +24,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 .venv/
+.venv-linux/
 venv/
 *.egg-info/
 dist/
@@ -38,3 +39,5 @@ build/
 # === SESSION FILES (gitignored per CLAUDE.md) ===
 HANDOFF.md
 CLAUDE.local.md
+for claude 
+readandunderstandargus.md

@@ -28,8 +28,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-import httpx
-
 from argus.analysis.feature_extractor import (
     GATE3_EXTENSIONS,
     NEVER_EXECUTE_NATIVELY,
@@ -297,6 +295,7 @@ class GateKeeper:
         """
         self._vt_rate_limit_wait()
 
+        import httpx  # lazy — only needed when VT key is configured
         url = f"https://www.virustotal.com/api/v3/files/{sha256}"
         try:
             with httpx.Client(timeout=15.0) as client:
@@ -742,6 +741,82 @@ def _windows_sandbox_available() -> bool:
         return False
 
 
+# ------------------------------------------------------------------
+# C1 — Exact intel hard-override interface (Phase 3 populates the sets)
+# ------------------------------------------------------------------
+
+@dataclass
+class ExactIntelResult:
+    """Return type of exact_intel_check — a hit locks verdict before any neural path."""
+    hit: bool
+    matched_indicator: str = ""
+    feed_source: str = ""        # openphish | urlhaus | abuseipdb | malwarebazaar
+    indicator_type: str = ""     # url | domain | ip | hash
+
+# Phase 3 / threat_feeds.py will populate these via exact_intel_load().
+# Membership test is O(1). DO NOT collapse into ChromaDB — exact match ≠ similarity score.
+_EXACT_URL_INDICATORS: set[str] = set()
+_EXACT_DOMAIN_INDICATORS: set[str] = set()
+_EXACT_IP_INDICATORS: set[str] = set()
+_EXACT_HASH_INDICATORS: set[str] = set()
+
+
+def exact_intel_check(
+    link_urls: list[str] | None = None,
+    link_domains: list[str] | None = None,
+    sender_ip: str | None = None,       # C3: only pass when originating_ip_trusted=True
+    attachment_sha256: list[str] | None = None,
+) -> ExactIntelResult:
+    """
+    Symbolic exact-match indicator lookup.  Called BEFORE classifier/LLM (C1 contract).
+
+    Any hit → verdict=SUSPICIOUS, confidence=0.95.  Classifier and LLM are skipped.
+    Stub: all sets empty until Phase 3 threat_feeds.py calls exact_intel_load().
+
+    Fuzzy/semantic matches belong in ChromaDB → LLM prompt (separate channel).
+    """
+    for url in (link_urls or []):
+        if url in _EXACT_URL_INDICATORS:
+            return ExactIntelResult(hit=True, matched_indicator=url,
+                                    feed_source="openphish", indicator_type="url")
+    for domain in (link_domains or []):
+        if domain in _EXACT_DOMAIN_INDICATORS:
+            return ExactIntelResult(hit=True, matched_indicator=domain,
+                                    feed_source="urlhaus", indicator_type="domain")
+    if sender_ip and sender_ip in _EXACT_IP_INDICATORS:
+        return ExactIntelResult(hit=True, matched_indicator=sender_ip,
+                                feed_source="abuseipdb", indicator_type="ip")
+    for sha256 in (attachment_sha256 or []):
+        if sha256 in _EXACT_HASH_INDICATORS:
+            return ExactIntelResult(hit=True, matched_indicator=sha256,
+                                    feed_source="malwarebazaar", indicator_type="hash")
+    return ExactIntelResult(hit=False)
+
+
+def exact_intel_load(
+    urls: set[str] | None = None,
+    domains: set[str] | None = None,
+    ips: set[str] | None = None,
+    hashes: set[str] | None = None,
+) -> None:
+    """Replace indicator sets atomically. Called by threat_feeds.py after each refresh."""
+    global _EXACT_URL_INDICATORS, _EXACT_DOMAIN_INDICATORS
+    global _EXACT_IP_INDICATORS, _EXACT_HASH_INDICATORS
+    if urls is not None:
+        _EXACT_URL_INDICATORS = urls
+    if domains is not None:
+        _EXACT_DOMAIN_INDICATORS = domains
+    if ips is not None:
+        _EXACT_IP_INDICATORS = ips
+    if hashes is not None:
+        _EXACT_HASH_INDICATORS = hashes
+    log.info(
+        "Exact intel loaded: %d URLs  %d domains  %d IPs  %d hashes",
+        len(_EXACT_URL_INDICATORS), len(_EXACT_DOMAIN_INDICATORS),
+        len(_EXACT_IP_INDICATORS), len(_EXACT_HASH_INDICATORS),
+    )
+
+
 def heuristic_verdict(
     features: dict, monitor_type: str = "file"
 ) -> tuple[str, float | None]:
@@ -750,7 +825,8 @@ def heuristic_verdict(
     Returns (verdict, confidence) or (UNANALYZED, None).
 
     Called by gate_keeper (file events only) and daemon (file + email events).
-    Flags only high-confidence signals to minimise false positives.
+    For email: C1 exact-intel override runs first; C2 independent per-signal scoring;
+    C3 IP is only passed to intel queries when originating_ip_trusted=True.
     """
     score = 0.0
 
@@ -778,23 +854,71 @@ def heuristic_verdict(
             score += 0.35
 
     elif monitor_type == "email":
-        # Reply-To domain differs from From domain — classic phishing signal
-        if features.get("reply_to_mismatch"):
-            score += 0.3
+        # C1: Exact intel hard-override — checked BEFORE any scoring.
+        # C3: sender_ip passed only when trusted — forged IP must not steer intel.
+        trusted_ip: str | None = (
+            features.get("originating_ip") or None
+        ) if features.get("originating_ip_trusted") else None
 
-        # Email auth failures: SPF/DKIM/DMARC
+        intel = exact_intel_check(
+            link_urls=[lk["href"] for lk in features.get("links", []) if isinstance(lk, dict)],
+            link_domains=features.get("link_domains") or [],
+            sender_ip=trusted_ip,
+            attachment_sha256=[],  # Part D populates attachment manifests
+        )
+        if intel.hit:
+            log.warning(
+                "Exact intel hit: %s [%s / %s] — verdict locked SUSPICIOUS",
+                intel.matched_indicator, intel.feed_source, intel.indicator_type,
+            )
+            return "SUSPICIOUS", 0.95
+
+        # C2: Score each signal independently — no auth_fails >= 2 floor.
+        # Weights ordered by signal strength (tune against labeled data in Phase 8).
+
+        # --- sender identity ---
+        if features.get("reply_to_mismatch"):
+            score += 0.30
+
+        # --- auth failures (each scored independently) ---
         spf = (features.get("spf") or "").lower()
         dkim = (features.get("dkim") or "").lower()
         dmarc = (features.get("dmarc") or "").lower()
-        auth_fails = sum(1 for v in [spf, dkim, dmarc] if "fail" in v)
-        if auth_fails >= 2:
-            score += 0.1 * auth_fails  # 0.2 for 2 fails, 0.3 for all three
 
-        # No plain-text alternative = phishing structure
+        # dmarc=fail means both SPF-alignment AND DKIM-alignment failed — strongest auth signal
+        if dmarc == "fail":
+            score += 0.35
+        elif dmarc == "softfail":
+            score += 0.15
+
+        if spf == "fail":
+            score += 0.25
+        elif spf == "softfail":
+            score += 0.10
+
+        # dkim_aligned=False when dkim=pass but d= != from_domain (B3) — authenticated spoof
+        if dkim == "pass" and not features.get("dkim_aligned", True):
+            score += 0.25
+        elif dkim == "fail":
+            score += 0.15
+
+        # --- behavioral flags from B1/B2 (catch auth-passing lookalikes) ---
+        if features.get("any_link_lookalike"):
+            score += 0.35
+        if features.get("sender_lookalike"):
+            score += 0.30
+        if features.get("any_text_href_mismatch"):
+            score += 0.30
+        if features.get("reply_to_lookalike"):
+            score += 0.20
+        if features.get("any_link_raw_ip"):
+            score += 0.20
+
+        # --- structure ---
         if features.get("html_only"):
             score += 0.15
 
-        # Sender domain registered < 30 days ago
+        # --- domain age ---
         whois_from = features.get("whois_from") or {}
         age = whois_from.get("domain_age_days")
         if age is not None and age < 7:
@@ -802,11 +926,13 @@ def heuristic_verdict(
         elif age is not None and age < 30:
             score += 0.15
 
-        # Reply-To domain also very new
         whois_reply = features.get("whois_reply_to") or {}
         reply_age = whois_reply.get("domain_age_days")
         if reply_age is not None and reply_age < 30:
-            score += 0.2
+            score += 0.20
+
+        # NOTE: Phase 3 AbuseIPDB scoring MUST gate on originating_ip_trusted (C3).
+        # Use trusted_ip (already gated above) — never features["originating_ip"] directly.
 
     if score >= 0.6:
         return "SUSPICIOUS", min(round(score, 4), 0.95)
@@ -893,5 +1019,58 @@ if __name__ == "__main__":
         sb = _windows_sandbox_available()
         print(f"Test 5: Windows Sandbox available: {sb}")
         print("Test 5: PASSED")
+
+    # Test 6: C1 exact-intel override
+    print("\nTest 6: C1 exact intel hard-override")
+    # 6a: stub always returns hit=False
+    r = exact_intel_check(link_urls=["http://evil.ru/steal"], link_domains=["evil.ru"])
+    assert r.hit is False, "Stub must return hit=False"
+    print("  6a: stub returns hit=False  PASSED")
+    # 6b: populate a URL, verify hit
+    exact_intel_load(urls={"http://known-phish.ru/login"})
+    r2 = exact_intel_check(link_urls=["http://known-phish.ru/login"])
+    assert r2.hit is True and r2.feed_source == "openphish"
+    print("  6b: exact URL hit → hit=True, source=openphish  PASSED")
+    # 6c: clean URL not in set → no hit
+    r3 = exact_intel_check(link_urls=["https://fiverr.com/"])
+    assert r3.hit is False
+    print("  6c: unknown URL → hit=False  PASSED")
+    # reset for subsequent tests
+    exact_intel_load(urls=set())
+    print("Test 6: PASSED")
+
+    # Test 7: C2 email scoring — independent per-signal weights
+    print("\nTest 7: C2 email auth scoring")
+    # 7a: dmarc=fail must contribute independently — old floor (auth_fails>=2) blocked it
+    # dmarc=fail(0.35) + reply_to_mismatch(0.30) = 0.65 → SUSPICIOUS
+    # Old code: dmarc=fail is 1 fail < floor of 2, so score=0+0.30=0.30 → UNANALYZED
+    v, conf = heuristic_verdict({"dmarc": "fail", "spf": "none", "dkim": "none",
+                                  "html_only": False, "reply_to_mismatch": True}, "email")
+    assert v == "SUSPICIOUS", f"dmarc=fail + reply_to_mismatch must now be SUSPICIOUS, got {v}"
+    print(f"  7a: dmarc=fail + reply_to_mismatch → SUSPICIOUS (conf={conf})  PASSED")
+    # 7b: authenticated lookalike + text_href_mismatch must cross threshold even with all-pass auth
+    v2, conf2 = heuristic_verdict({
+        "spf": "pass", "dkim": "pass", "dmarc": "pass",
+        "dkim_aligned": True,
+        "any_link_lookalike": True, "any_text_href_mismatch": True,
+        "any_link_raw_ip": False, "sender_lookalike": False,
+        "reply_to_mismatch": False, "reply_to_lookalike": False,
+        "html_only": False,
+    }, "email")
+    assert v2 == "SUSPICIOUS", f"auth-passing lookalike + mismatch must be SUSPICIOUS, got {v2}"
+    print(f"  7b: all-pass + lookalike + mismatch → SUSPICIOUS (conf={conf2})  PASSED")
+    # 7c: C3 trust gate — forged IP must not reach exact_intel_check
+    features_forged = {
+        "originating_ip": "1.2.3.4", "originating_ip_trusted": False,
+        "spf": "none", "dkim": "none", "dmarc": "none",
+        "links": [], "link_domains": [], "html_only": False, "reply_to_mismatch": False,
+    }
+    exact_intel_load(ips={"1.2.3.4"})  # pretend this IP is known-bad
+    v3, _ = heuristic_verdict(features_forged, "email")
+    # Forged IP should NOT trigger the intel hit because originating_ip_trusted=False
+    assert v3 == "UNANALYZED", f"Forged IP must not trigger intel hit, got {v3}"
+    exact_intel_load(ips=set())
+    print("  7c: forged IP (trusted=False) not scored by exact_intel  PASSED")
+    print("Test 7: PASSED")
 
     print("\n=== All tests passed ===")
