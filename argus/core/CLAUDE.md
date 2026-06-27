@@ -13,8 +13,12 @@ plus the current row's content. This is a correctness requirement, not style. Ta
 made *detectable*, not *impossible* — the chain proves alteration after the fact; it does
 not prevent it. The distinction matters and must be stated honestly in the README.
 
-**`threading.Lock` on all writes.** Multiple daemon threads write concurrently. Without the
-lock, interleaved writes corrupt the chain. The lock is a correctness requirement.
+**`threading.Lock` on all writes.** Through Phase 8 the event-processor is the main writer,
+but it is not the only one — the main thread writes startup/shutdown/tamper-check incidents,
+and Phase 4 (tray: user-confirm updates) and Phase 7 (cloud-sync) add more writers. Any
+interleaving corrupts the hash chain, so the lock is a correctness requirement, not a
+forward-looking nicety. (Single lock + single connection is acknowledged debt — fine while
+writes stay low-volume; revisit at Phase 9.)
 
 **Known debt (do not fix without explicit instruction):**
 - `chain_hash` covers only `incident_id`, `timestamp`, `verdict`, and `chain_hash` — not
@@ -31,21 +35,29 @@ lock, interleaved writes corrupt the chain. The lock is a correctness requiremen
 
 **Gate sequence: four gates, strict order. Cheaper gates run first. Never skip a gate.**
 
-> **Note:** The module-level docstring currently reads "Three-gate security pipeline" —
-> this is a misnomer. The live implementation defines four gates: 1, 1.5, 2, and 3.
-> `gate_reached` takes values 1, 15 (Gate 1.5), 2, or 3. Fix the docstring on next touch.
+> **Note (gate-count contradiction resolved against live code):** the canonical count is
+> **four** gates: 1, 1.5, 2, 3 (`gate_reached` ∈ {1, 15, 2, 3}). The code contradicts
+> itself — the `GateKeeper` class docstring already says "four-gate" but the module-level
+> docstring (line 5) still says "Three-gate security pipeline." Fix only that module-level
+> line on next touch.
 
 | Gate | What | Cost |
 |---|---|---|
 | Gate 1 | Windows Defender (MpCmdRun.exe, 60s timeout) | Cheapest authoritative check |
 | Gate 1.5 | VirusTotal SHA-256 hash lookup (skip if no API key) | Hash only; free tier |
-| Gate 2 | Static analysis: feature extraction + inference | More expensive |
+| Gate 2 | Static analysis: feature extraction + `heuristic_verdict()` (Phase 2 inference slots in via `inference_router`) | More expensive |
 | Gate 3 | Dynamic/human routing: sandbox (scripts), HUMAN_DECISION (executables) | Most expensive; stubbed until Phase 3 |
 
 Gate 3 returning `UNAVAILABLE` → route to `HOLD_FOR_HUMAN`. This is correct behavior.
 
-**VirusTotal rate limit.** Free tier = 4 req/min. Cache first, network second. Never issue
-a VT request without checking the hash cache first.
+**VirusTotal rate limit.** Free tier = 4 req/min — enforced by `_vt_rate_limit_wait()`
+(sliding 60s window, blocks when 4 requests are in-flight). Verified present.
+
+> **Gap (this audit):** the architecture record lists "hash caching" as a gate_keeper
+> property, but the live code has **only** the rate limiter — no result memoization by
+> SHA-256. A repeated hash re-queries VT and burns a rate slot. Contract for whoever
+> touches this next: add a SHA-256 → verdict cache and check it before the network call.
+> Do not state hash-caching as existing behavior until it does.
 
 **ACL deny-execute on the staging zone** (`~/Downloads`) must be set before analysis
 completes, not after. The file must not be executable while the pipeline is running.
@@ -61,19 +73,31 @@ on an exact-match hit. Interface stub is present; Phase 3 `threat_feeds.py` popu
 
 ## daemon.py
 
-**Five concurrent execution contexts and their ownership:**
-- Main thread: pystray tray icon (pystray must own the main thread — framework requirement)
-- Thread 1: staged-file-events → `gate_keeper`
-- Thread 2: desktop-file-events → `feature_extractor` → inference → `logger`
-- Thread 3: email-poll → `email_scanner` → scoring → `logger`
-- Thread 4: cloud-sync queue processor (async, best-effort, non-blocking)
+**Threading model (verified against the daemon.py docstring — single shared queue, single
+consumer). Producers never consume; the one consumer owns all dispatch and the synchronous
+SQLite write.**
 
-Thread boundaries are not to be blurred without an architectural decision recorded in
-`HANDOFF.md`.
+| Thread | Role |
+|---|---|
+| Main | Blocks in `wait_for_shutdown()`; pystray takes this slot in Phase 4 |
+| file-watcher | watchdog Observer; produces **both** staged and desktop file events into the shared `event_queue` |
+| email-scanner | IMAP poll; produces email events into the **same** `event_queue` |
+| event-processor | **Single consumer**: reads `event_queue`, dispatches staged → `gate_keeper`, desktop/email → `extractor` + heuristics + `logger`. Logging is synchronous here — there is **no** separate logger thread |
+| cloud-sync-stub | Drains `sync_queue` (Phase 7 adds real BigQuery/GCS writes) |
 
-**Event routing rule:**
-- `event.staged == True` → `gate_keeper.process(event)`
-- `event.staged == False` → `extractor.extract(event)` → inference → `logger`
+> **Correction (this audit):** an earlier draft and the source directive both described
+> separate "staged-file-events," "gate_keeper-dispatch," and "logger" threads. The live code
+> has none of those — one `event_queue`, one `event-processor` consumer, synchronous logging.
+> Do not split these without an architectural decision recorded in `HANDOFF.md`.
 
-**Graceful shutdown** must drain in-flight events before exit. A shutdown mid-analysis must
-not silently drop a verdict.
+Inter-thread communication is via `queue.Queue` (`event_queue`, `sync_queue`) only. The one
+exception is the D3 `_attachment_correlation_cache` dict, shared between the email-scanner
+(writes) and event-processor (reads/pops) — the documented exception, not a precedent.
+
+**Event routing rule** (in `_dispatch`):
+- `source == "file_watcher" and staged` → `gate_keeper.process(event)`
+- otherwise → `extractor.extract(event)` → `heuristic_verdict()` (Phase 2 inference slots in here) → `logger`
+
+**Graceful shutdown** must drain in-flight events before exit. `stop()` signals shutdown,
+stops monitors first (no new events), then joins the processor (up to 90s: 60s Defender + 30s
+buffer) so the queue fully drains. A shutdown mid-analysis must not silently drop a verdict.

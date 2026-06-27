@@ -3,6 +3,31 @@
 
 ---
 
+## Operating Model — DOE Framework (Directive → Orchestration → Execution)
+
+ARGUS is built on DOE. You are the **Orchestration** layer.
+- **Directive** — the build order, per-module contracts, and `HANDOFF.md` are your SOP.
+- **Orchestration (you)** — read the SOP, route deterministic work to code, apply judgment
+  only where judgment is needed.
+- **Execution** — deterministic Python; same input → same output, always.
+
+**The one rule:** you do not do work the code should do; the code does not make the calls
+you should make. *Why:* success compounds multiplicatively (P^N) — a 5-step chain at 90%/step
+succeeds 59% of the time. Pushing deterministic work into code drops those steps to 0%
+variance, leaving only routing decisions probabilistic. (`compound-error-probability`)
+
+- **Delegation** — deterministic, isolated work (RAG queries, cloud writes, PDF generation)
+  goes to a sub-agent with fresh context; never pollute the main thread. Never dispatch
+  silently. (`context-pollution`, `skills-vs-subagents`)
+- **Autonomy** — expand capability one proven rung at a time; never skip phase verification.
+  (`smallest-unit-of-autonomy`)
+
+Full reasoning lives in `resources/doi-framework/`. Consult the file named in parentheses
+when a decision touches that topic — load the one that applies, not all nine (reading every
+doc each session is the context pollution they warn against).
+
+---
+
 ## Session Start Protocol — Every Session, No Exceptions
 
 1. Read `CLAUDE.md` (this file)
@@ -62,7 +87,8 @@ it is not already in a subfolder file. If it is, remove it from there. **One hom
 
 On any error: diagnose root cause (read the traceback) → fix autonomously → add inline
 comment (what broke and why) → log in `HANDOFF.md` change log (newest on top, `## [` prefix)
-→ retry → only escalate if genuinely exhausted all approaches. Never fake success.
+→ retry → only escalate if genuinely exhausted all approaches. Never fake success. Every
+fixed error makes the next failure different. (`self-annealing`)
 
 ## Session Handoff Protocol
 

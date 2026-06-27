@@ -54,15 +54,19 @@ without invoking local or cloud inference. This is the Channel 1 path (see root
    `_is_shortener(domain)` in the B1 link-domain loop, roll up `any_link_shortener`,
    consume it in C2 heuristic scoring.
 
-2. **WHOIS cap counts cache hits.** `whois_count` increments on every domain including
-   those already in the LRU cache. It must count cache misses only (actual network calls).
-   Fix: check cache first; increment `whois_count` only on a miss.
+2. **WHOIS cap counts cache hits.** Verified open: `_extract_email` calls
+   `self._cached_whois(domain)` then increments `whois_count` unconditionally
+   (`feature_extractor.py` ~L338–339), so a hit on the 24h-TTL cache still burns a slot of
+   `MAX_LINK_WHOIS` (=5). It must count cache misses only (actual network calls). Fix: have
+   `_cached_whois` signal hit vs. miss, and increment `whois_count` only on a miss.
 
-3. **No `MAX_PARTS_PER_MESSAGE` count cap.** Size caps bound bytes but a 500-tiny-part
-   email forces ~500 sequential IMAP round trips, stalling the single poll thread
-   (DoS-by-stall, not crash). Fix: add a named count cap (default 20) alongside the
-   existing size caps; stop fetching parts past the limit, set `oversized_part_skipped=True`,
-   continue processing the message with what was fetched.
+3. **No `MAX_PARTS_PER_MESSAGE` count cap.** Verified open: the part loop
+   (`email_scanner.py` ~L1013–1063) has size caps (`MAX_PART_BYTES`, `MAX_MESSAGE_BYTES`)
+   and already sets `oversized_part_skipped=True` on a size overflow — but there is **no
+   count cap**, so a 500-tiny-part email still forces ~500 sequential IMAP round trips,
+   stalling the single poll thread (DoS-by-stall, not crash). Fix: add a named count cap
+   (default 20); stop fetching parts past the limit and reuse the **existing**
+   `oversized_part_skipped` flag, then continue with what was fetched.
 
 **Cloud allowlist is owned by Phase-2 `router.py`, not this module.** `email_scanner`
 produces raw features; allowlist enforcement happens at the router boundary. For reference,
