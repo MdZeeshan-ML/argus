@@ -344,6 +344,7 @@ class ArgusDaemon:
         self._cfg = config
         self._shutdown = threading.Event()
         self._event_queue: queue.Queue = queue.Queue(maxsize=1000)
+        self._sync_queue: queue.Queue = queue.Queue()
         # D3: shared {filename: (correlation_id, monotonic_ts)} linking email and file incidents
         self._attachment_correlation_cache: dict[str, tuple[str, float]] = {}
 
@@ -561,10 +562,11 @@ class ArgusDaemon:
                     "staged": True,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
+                    swept += 1
                 except queue.Full:
                     log.warning("Queue full , event dropped , path: %s", f)
                 
-                swept += 1
+                
         except OSError as e:
             log.warning("Staging sweep failed (non-fatal): %s", e)
 
