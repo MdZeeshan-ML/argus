@@ -902,7 +902,8 @@ class EmailScanner:
             folder_state["last_seen_uidnext"] = current_uidnext
 
         if emit_incident:
-            self._queue.put({
+            try:
+                self._queue.put_nowait({
                 "source": "email_scanner",
                 "event_type": "email_uidvalidity_reset",
                 "severity": "low",
@@ -919,6 +920,10 @@ class EmailScanner:
                     "new_last_uid": last_uid,
                 },
             })
+
+            except queue.Full :
+                log.warning("Queue full , event dropped , Folder: %s", folder)
+
         else:
             log.info(
                 "First run: folder=%s last_uid=%d uidvalidity=%s (skipping %d existing emails)",
@@ -1103,7 +1108,10 @@ class EmailScanner:
             "summary": summary,
             "metadata": metadata,
         }
-        self._queue.put(entry)
+        try:
+            self._queue.put_nowait(entry)
+        except queue.Full:
+            log.warning("Queue full , event dropped , Folder: %s", folder)
 
         # D3: register each attachment filename so daemon can link the file incident
         if self._attachment_correlation_cache is not None and attachment_manifest:
@@ -1147,7 +1155,8 @@ class EmailScanner:
             if (self._auth_fail_streak >= _AUTH_INCIDENT_THRESHOLD
                     and not self._auth_incident_sent):
                 self._auth_incident_sent = True
-                self._queue.put({
+                try:
+                    self._queue.put_nowait({
                     "source": "email_scanner",
                     "event_type": "email_auth_failing",
                     "severity": "high",
@@ -1163,6 +1172,9 @@ class EmailScanner:
                         "consecutive_auth_failures": self._auth_fail_streak,
                     },
                 })
+                except queue.Full:
+                    log.warning("Queue full , event dropped , Address: %s", self._address)
+
             return None
         except OSError as exc:
             log.error("IMAP connection error: %s", exc)

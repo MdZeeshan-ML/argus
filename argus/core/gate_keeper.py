@@ -150,7 +150,16 @@ class GateKeeper:
                 reason=f"File still being written after {_STABILITY_MAX_WAIT:.0f}s — held in staging zone (execute denied)",
                 action_taken="HOLD_UNANALYZED",
             )
-
+        if stability == "empty":
+            return self._finalize(
+                path=path,
+                verdict="UNANALYZED", 
+                gate_reached=0,
+                features={"file_name": path.name},
+                reason="File was 0 bytes",
+                action_taken="HOLD_FOR_HUMAN",
+            )
+            
         # -- Gate 1: Windows Defender ------------------------------------------
         defender_clean, defender_detail = self._gate1_defender(path)
         if not defender_clean:
@@ -684,6 +693,9 @@ class GateKeeper:
         while time.monotonic() < deadline:
             try:
                 size = path.stat().st_size
+                if size == 0:
+                    return "empty"
+                     
             except OSError:
                 return "vanished"  # file gone
 

@@ -218,6 +218,19 @@ def _dispatch(
 
     # ----- Desktop file or email: direct pipeline -----
     monitor_type = "file" if source == "file_watcher" else "email"
+    if source == "file_watcher":
+        path = Path(event.get("path",""))
+        #in case the file vanishes
+        try :
+            size_before = path.stat().st_size
+            time.sleep(0.5)
+            size_after = path.stat().st_size
+            if size_before != size_after :
+                log.warning("File is still writing!, path = %s", path.name)
+                return
+        except OSError :
+            log.warning("File vanished!, path = %s", path.name)
+            return
 
     features = extractor.extract(event)
 
@@ -330,8 +343,7 @@ class ArgusDaemon:
     def __init__(self, config: dict) -> None:
         self._cfg = config
         self._shutdown = threading.Event()
-        self._event_queue: queue.Queue = queue.Queue()
-        self._sync_queue: queue.Queue = queue.Queue()
+        self._event_queue: queue.Queue = queue.Queue(maxsize=1000)
         # D3: shared {filename: (correlation_id, monotonic_ts)} linking email and file incidents
         self._attachment_correlation_cache: dict[str, tuple[str, float]] = {}
 
@@ -541,13 +553,17 @@ class ArgusDaemon:
                         continue
                 except OSError:
                     continue
-                self._event_queue.put({
+                try:
+                    self._event_queue.put_nowait({
                     "source": "file_watcher",
                     "path": str(f),
                     "event_type": "startup_sweep",
                     "staged": True,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
+                except queue.Full:
+                    log.warning("Queue full , event dropped , path: %s", f)
+                
                 swept += 1
         except OSError as e:
             log.warning("Staging sweep failed (non-fatal): %s", e)
@@ -560,7 +576,7 @@ class ArgusDaemon:
         Inject a synthetic event directly into the processing queue.
         Used only in testing — not part of normal operation.
         """
-        self._event_queue.put(event)
+        self._event_queue.put_nowait(event)
 
     def wait_for_queue_drain(self, timeout: float = 10.0) -> bool:
         """Block until event_queue is fully processed. Test helper."""

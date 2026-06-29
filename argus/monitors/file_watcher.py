@@ -50,16 +50,21 @@ def _is_staged(path: Path) -> bool:
     try:
         # Only the root of Downloads is staged — Cleared/ subdirectory is not
         return path.parent.resolve() == _STAGING_DIR.resolve()
+        # If you can't confirm whether something is in Downloads, treat it as 
+        # staged and put it through the gate. Over-gating is safe. 
+        # Under-gating is a hole.
     except OSError:
-        return False
+        return True
 
 
 class _FileCreatedHandler(FileSystemEventHandler):
     """Internal watchdog handler — converts OS events into queue entries."""
+    
 
     def __init__(self, event_queue: queue.Queue) -> None:
         super().__init__()
         self._queue = event_queue
+        self._seen: dict[str, float] = {} 
 
     def on_created(self, event: FileCreatedEvent) -> None:
         if event.is_directory:
@@ -68,8 +73,14 @@ class _FileCreatedHandler(FileSystemEventHandler):
         path = Path(event.src_path)
 
         if _is_temp_file(path):
+
             log.debug("Skipping temp file: %s", path.name)
             return
+
+        now = time.time()
+        if str(path) in self._seen and now - self._seen[str(path)] < 1.0 :
+            return
+        self._seen[str(path)] = now
 
         entry = {
             "source": "file_watcher",
@@ -78,8 +89,12 @@ class _FileCreatedHandler(FileSystemEventHandler):
             "staged": _is_staged(path),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        self._queue.put(entry)
-        log.info("File detected (%s): %s", "staged" if entry["staged"] else "direct", path)
+        try :
+            self._queue.put_nowait(entry)
+            log.info("File detected (%s): %s", "staged" if entry["staged"] else "direct", path)
+        except queue.Full :
+            log.warning("Queue full, event dropped , File Path at: %s", path.name)
+
 
     def on_moved(self, event) -> None:
         """
@@ -105,8 +120,13 @@ class _FileCreatedHandler(FileSystemEventHandler):
             "staged": staged,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        self._queue.put(entry)
-        log.info("Download complete (%s): %s", "staged" if staged else "direct", dest)
+        try :
+            self._queue.put_nowait(entry)
+            log.info("Download complete (%s): %s", "staged" if staged else "direct", dest)
+        except queue.Full :
+            log.warning("Queue full, event dropped , File Path at: %s", dest.name)
+
+        
 
 
 class FileWatcher:
