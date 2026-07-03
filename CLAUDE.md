@@ -47,19 +47,29 @@ Module-specific contracts live in each subfolder's `CLAUDE.md`.
 
 ## Architecture Invariants — Cross-Cutting
 
-**Three-tier inference.** Fast classifier → local LLM (uncertain zone only) → cloud
-escalation. The LLM is a rendering layer, not the decision layer. Containment decisions are
-made by the deterministic/symbolic layer and execute before the LLM runs.
+Full rationale for each invariant below lives in `architecture/ARCHITECTURE.md`
+§3 — this section states the operational rule only, per this file's own
+one-home-per-rule discipline. (2026-07-04 audit, `architecture/audit.md`
+finding R5, found this section re-narrating full rationale rather than
+pointing to it; trimmed here.)
 
-**Neuro-symbolic override.** Symbolic constraints (hard rules, MITRE ATT&CK graph) override
-neural outputs unconditionally. A 1.7B model can rationalize away a fact; a graph rule or
-set-membership test cannot. Where a hard fact exists, the symbolic layer decides.
+**Three-tier inference.** Fast classifier → local LLM (uncertain zone only) → cloud
+escalation. The LLM is a rendering layer, not the decision layer: containment
+decisions are made by the deterministic/symbolic layer and execute before the
+LLM runs.
+
+**Neuro-symbolic override.** Symbolic constraints (hard rules; a MITRE ATT&CK graph
+is named but not yet justified by any built decision — open question, see
+`argus/analysis/CLAUDE.md` rag/ section) override neural outputs unconditionally.
+Where a hard fact exists, the symbolic layer decides — the model is not consulted
+on that point.
 
 **Exact-vs-fuzzy threat-intel split.** Two channels, never merged:
 - Channel 1 (exact — hash/URL/IP): Python sets; O(1) membership test; consumed by
   `gate_keeper.exact_intel_check`; locks verdict SUSPICIOUS; LLM never invoked on a hit.
-- Channel 2 (fuzzy/semantic): ChromaDB embedding index; top-k similarity with scores;
-  consumed by the LLM as RAG context; treated as evidence, not locked fact.
+- Channel 2 (fuzzy/semantic): planned ChromaDB embedding index; top-k similarity with
+  scores; consumed by the LLM as RAG context, treated as evidence not locked fact —
+  **corpus undefined, see `argus/analysis/CLAUDE.md` rag/ section before building.**
 
 **Privacy boundary.** File contents never leave a module. Only metadata travels to
 inference. `feature_extractor` reads bytes for structure only, never content for meaning.

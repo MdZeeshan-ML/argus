@@ -46,27 +46,27 @@ email scoring path is a Python-set membership test. A hit locks the verdict `SUS
 without invoking local or cloud inference. This is the Channel 1 path (see root
 `CLAUDE.md` — Exact-vs-fuzzy split).
 
-**Three known bugs — Phase 1 is not closed until all three are fixed:**
+**Three invariants a past audit found broken — fixed session 12 (2026-06-30), see
+`HANDOFF.md` ES-bug-1/2/3. Kept here as the contracts, not as open bugs (2026-07-04
+doc sweep, audit finding R2/R6 — a fixed bug left recorded as "not closed" here was
+exactly the drift that sweep exists to catch):**
 
-1. **`_is_shortener` is never called.** It is defined in `feature_extractor` but never
-   invoked in `_extract_email`. `any_link_shortener` is not rolled up into features and not
-   consumed by `gate_keeper` — shortener links are invisible to scoring. Fix: call
-   `_is_shortener(domain)` in the B1 link-domain loop, roll up `any_link_shortener`,
-   consume it in C2 heuristic scoring.
+1. **`any_link_shortener` must reach scoring.** `_is_shortener(domain)` runs in the
+   B1 link-domain loop, rolls up into `any_link_shortener`, and is consumed in C2
+   heuristic scoring (+0.15). If a future edit to the B1 loop drops this wiring,
+   shortener links go invisible to scoring again — that's the failure mode this
+   contract guards against.
 
-2. **WHOIS cap counts cache hits.** Verified open: `_extract_email` calls
-   `self._cached_whois(domain)` then increments `whois_count` unconditionally
-   (`feature_extractor.py` ~L338–339), so a hit on the 24h-TTL cache still burns a slot of
-   `MAX_LINK_WHOIS` (=5). It must count cache misses only (actual network calls). Fix: have
-   `_cached_whois` signal hit vs. miss, and increment `whois_count` only on a miss.
+2. **WHOIS cap counts network calls, not cache hits.** `MAX_LINK_WHOIS` (=5) must
+   burn a slot only on an actual miss against the 24h-TTL cache — a cache hit is a
+   dict lookup, not a rate-limited call, and must not count against the cap.
 
-3. **No `MAX_PARTS_PER_MESSAGE` count cap.** Verified open: the part loop
-   (`email_scanner.py` ~L1013–1063) has size caps (`MAX_PART_BYTES`, `MAX_MESSAGE_BYTES`)
-   and already sets `oversized_part_skipped=True` on a size overflow — but there is **no
-   count cap**, so a 500-tiny-part email still forces ~500 sequential IMAP round trips,
-   stalling the single poll thread (DoS-by-stall, not crash). Fix: add a named count cap
-   (default 20); stop fetching parts past the limit and reuse the **existing**
-   `oversized_part_skipped` flag, then continue with what was fetched.
+3. **`MAX_PARTS_PER_MESSAGE` (=20) bounds IMAP round trips per message,
+   independent of the byte-size caps** (`MAX_PART_BYTES`, `MAX_MESSAGE_BYTES`).
+   Byte caps alone don't stop a many-tiny-part message from forcing hundreds of
+   sequential round trips and stalling the single poll thread (DoS-by-stall, not
+   crash). Past the count cap, stop fetching and set `oversized_part_skipped=True`
+   (shared flag with the byte-cap path) — don't add a second flag.
 
 **Cloud allowlist is owned by Phase-2 `router.py`, not this module.** `email_scanner`
 produces raw features; allowlist enforcement happens at the router boundary. For reference,
@@ -74,4 +74,6 @@ the permitted cloud fields are: `sender_domain`, `whois_age`, `spf`, `dkim`, `dm
 `dkim_aligned`, `link_domains` (query strings stripped), `any_link_lookalike`,
 `any_text_href_mismatch`, `originating_ip` (only when `originating_ip_trusted`), and the
 attachment manifest (no bytes). The email subject is `_sensitive` — local inference only,
-never cloud.
+never cloud. **Canonical source: `architecture/ARCHITECTURE.md` §3.5 — this is a reference
+subset, not a second copy of record; if the two ever disagree, ARCHITECTURE.md wins and this
+list is stale.**

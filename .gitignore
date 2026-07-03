@@ -37,11 +37,15 @@ build/
 .idea/
 
 # === SESSION FILES (gitignored per CLAUDE.md) ===
-HANDOFF.md
-CLAUDE.local.md
-for claude 
-readandunderstandargus.md
-architecture/
+# Anchored to repo root (leading /): without it, git matches the basename
+# anywhere in the tree, and this repo has core.ignorecase=true, so an
+# unrelated file like .claude/commands/handoff.md was silently swallowed by
+# the bare "HANDOFF.md" pattern below (found 2026-07-04).
+/HANDOFF.md
+/CLAUDE.local.md
+/for claude
+/readandunderstandargus.md
+/architecture/
 
 .DS_Store
 argus.code-workspace
