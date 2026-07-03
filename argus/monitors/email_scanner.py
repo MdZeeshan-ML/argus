@@ -56,6 +56,9 @@ _URL_RE = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
 # Per-part and per-message size caps used by the two-phase IMAP fetch (A5)
 MAX_PART_BYTES = 5 * 1024 * 1024      # 5 MB — skip any single MIME part above this
 MAX_MESSAGE_BYTES = 25 * 1024 * 1024  # 25 MB — stop fetching further parts beyond this total
+# ES-bug-3: cap on IMAP round-trips per message — a 500-tiny-part email with no size
+# cap stalls the poll thread with ~500 sequential fetches (DoS-by-stall, not crash)
+MAX_PARTS_PER_MESSAGE = 20
 
 _DANGEROUS_EXTENSIONS: frozenset[str] = frozenset({
     ".exe", ".scr", ".bat", ".cmd", ".ps1", ".psd1", ".psm1",
@@ -1011,6 +1014,7 @@ class EmailScanner:
         has_attachments = False
         oversized_part_skipped = False
         total_fetched = 0
+        parts_fetched = 0   # ES-bug-3: counts IMAP round-trips (text parts only)
         seen_ctypes: set[str] = set()
 
         attachment_manifest: list[dict] = []
@@ -1046,6 +1050,16 @@ class EmailScanner:
             if not is_text:
                 continue
 
+            # ES-bug-3: count cap prevents ~500 IMAP round-trips on adversarially
+            # crafted many-tiny-part messages; reuses oversized_part_skipped flag
+            if parts_fetched >= MAX_PARTS_PER_MESSAGE:
+                oversized_part_skipped = True
+                log.warning(
+                    "UID %s: part count cap (%d) reached — remaining parts skipped",
+                    uid, MAX_PARTS_PER_MESSAGE,
+                )
+                break
+
             if (part["size"] > MAX_PART_BYTES
                     or total_fetched + part["size"] > MAX_MESSAGE_BYTES):
                 oversized_part_skipped = True
@@ -1059,6 +1073,7 @@ class EmailScanner:
             status2, data2 = conn.uid(
                 "fetch", uid, f"(BODY.PEEK[{part['part_num']}])"
             )
+            parts_fetched += 1
             if status2 != "OK":
                 log.warning("Part fetch failed UID %s part %s", uid, part["part_num"])
                 continue

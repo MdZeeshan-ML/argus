@@ -308,6 +308,7 @@ class FeatureExtractor:
         any_link_lookalike = False
         any_link_raw_ip = False
         any_text_href_mismatch = False
+        any_link_shortener = False   # ES-bug-1: was never initialised or populated
         whois_count = 0
         seen_domains: set[str] = set()
 
@@ -327,16 +328,28 @@ class FeatureExtractor:
 
             if _is_raw_ip(domain):
                 any_link_raw_ip = True
-                continue  # no WHOIS/lookalike on bare IPs
+                continue  # no WHOIS/lookalike/shortener on bare IPs
+
+            # ES-bug-1: wire in the shortener check that was defined but never called
+            if _is_shortener(domain):
+                any_link_shortener = True
 
             # B2: lookalike check on each unique link domain
             if _check_lookalike(domain, self._brands, self._confusables)[0]:
                 any_link_lookalike = True
 
-            # WHOIS with hard per-message cap (MAX_LINK_WHOIS)
+            # WHOIS with hard per-message cap (MAX_LINK_WHOIS).
+            # ES-bug-2: only count cache misses (actual network calls) against the cap;
+            # a cache hit is free and must not burn a rate slot.
             if whois_count < MAX_LINK_WHOIS:
+                now = time.monotonic()
+                is_cached = (
+                    domain in self._whois_cache
+                    and now - self._whois_cache[domain][0] < self._whois_cache_ttl
+                )
                 result = self._cached_whois(domain)
-                whois_count += 1
+                if not is_cached:
+                    whois_count += 1
                 if result and result.get("domain_age_days") is not None:
                     age: int = result["domain_age_days"]
                     if link_min_age is None or age < link_min_age:
@@ -347,6 +360,7 @@ class FeatureExtractor:
         features["any_link_lookalike"] = any_link_lookalike
         features["any_link_raw_ip"] = any_link_raw_ip
         features["any_text_href_mismatch"] = any_text_href_mismatch
+        features["any_link_shortener"] = any_link_shortener
 
         return features
 

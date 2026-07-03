@@ -928,6 +928,10 @@ def heuristic_verdict(
             score += 0.20
         if features.get("any_link_raw_ip"):
             score += 0.20
+        # ES-bug-1: shortener links are a weaker signal (legitimate marketing use);
+        # scored below raw-IP but still raises suspicion when combined with auth failures
+        if features.get("any_link_shortener"):
+            score += 0.15
 
         # --- structure ---
         if features.get("html_only"):

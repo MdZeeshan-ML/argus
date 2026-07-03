@@ -27,13 +27,14 @@ from watchdog.observers import Observer
 log = logging.getLogger(__name__)
 
 # Extensions that indicate a file is still being written — skip until final rename
-_TEMP_SUFFIXES = {".tmp", ".crdownload", ".part", ".partial", ".download", ".!ut"}
+# FW-8: .opdownload (Opera), .crswap (Chrome swap file) added to cover common gaps
+_TEMP_SUFFIXES = {
+    ".tmp", ".crdownload", ".part", ".partial", ".download", ".!ut",
+    ".opdownload", ".crswap",
+}
 
 # Windows lock-file prefix (Office, etc.)
 _TEMP_PREFIXES = ("~$",)
-
-# Downloads is the staging zone — daemon routes these through gate_keeper
-_STAGING_DIR = Path.home() / "Downloads"
 
 
 def _is_temp_file(path: Path) -> bool:
@@ -45,26 +46,24 @@ def _is_temp_file(path: Path) -> bool:
     return False
 
 
-def _is_staged(path: Path) -> bool:
-    """True if the file is in the Downloads staging zone (not a subdirectory)."""
+def _is_staged(path: Path, staging_dir: Path) -> bool:
+    """True if path sits directly in the staging zone root (not a subdirectory)."""
     try:
-        # Only the root of Downloads is staged — Cleared/ subdirectory is not
-        return path.parent.resolve() == _STAGING_DIR.resolve()
-        # If you can't confirm whether something is in Downloads, treat it as 
-        # staged and put it through the gate. Over-gating is safe. 
-        # Under-gating is a hole.
+        # Only the root of Downloads is staged — Cleared/ subdirectory is not.
+        # If resolve() fails, fail closed: over-gating is safe; under-gating is a hole.
+        return path.parent.resolve() == staging_dir.resolve()
     except OSError:
         return True
 
 
 class _FileCreatedHandler(FileSystemEventHandler):
     """Internal watchdog handler — converts OS events into queue entries."""
-    
 
-    def __init__(self, event_queue: queue.Queue) -> None:
+    def __init__(self, event_queue: queue.Queue, staging_dir: Path) -> None:
         super().__init__()
         self._queue = event_queue
-        self._seen: dict[str, float] = {} 
+        self._staging_dir = staging_dir
+        self._seen: dict[str, float] = {}
 
     def on_created(self, event: FileCreatedEvent) -> None:
         if event.is_directory:
@@ -73,12 +72,11 @@ class _FileCreatedHandler(FileSystemEventHandler):
         path = Path(event.src_path)
 
         if _is_temp_file(path):
-
             log.debug("Skipping temp file: %s", path.name)
             return
 
         now = time.time()
-        if str(path) in self._seen and now - self._seen[str(path)] < 1.0 :
+        if str(path) in self._seen and now - self._seen[str(path)] < 1.0:
             return
         self._seen[str(path)] = now
 
@@ -86,32 +84,43 @@ class _FileCreatedHandler(FileSystemEventHandler):
             "source": "file_watcher",
             "path": str(path),
             "event_type": "created",
-            "staged": _is_staged(path),
+            "staged": _is_staged(path, self._staging_dir),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        try :
+        try:
             self._queue.put_nowait(entry)
             log.info("File detected (%s): %s", "staged" if entry["staged"] else "direct", path)
-        except queue.Full :
-            log.warning("Queue full, event dropped , File Path at: %s", path.name)
-
+        except queue.Full:
+            log.warning("Queue full, event dropped, file: %s", path.name)
 
     def on_moved(self, event) -> None:
         """
         Browsers rename .crdownload → real filename when download completes.
         We catch the final rename here so we don't miss completed downloads.
-        Cleared/ files moving out are ignored — they already passed all gates.
+
+        FW-9: Drop events where the SOURCE is inside Cleared/ — those files already
+        passed all gates. We check src (not just dest) because a move FROM Cleared/
+        back into the staging root would otherwise be incorrectly re-gated.
         """
         if event.is_directory:
             return
 
+        src = Path(event.src_path)
         dest = Path(event.dest_path)
 
         if _is_temp_file(dest):
             return
 
-        # Ignore renames within Cleared/ or moves out of staging zone
-        staged = _is_staged(dest)
+        # FW-9: if the move originates from Cleared/, it already cleared all gates — drop it
+        cleared_dir = self._staging_dir / "Cleared"
+        try:
+            if src.parent.resolve() == cleared_dir.resolve():
+                log.debug("on_moved: src from Cleared/, dropping: %s", src.name)
+                return
+        except OSError:
+            pass
+
+        staged = _is_staged(dest, self._staging_dir)
 
         entry = {
             "source": "file_watcher",
@@ -120,11 +129,11 @@ class _FileCreatedHandler(FileSystemEventHandler):
             "staged": staged,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        try :
+        try:
             self._queue.put_nowait(entry)
             log.info("Download complete (%s): %s", "staged" if staged else "direct", dest)
-        except queue.Full :
-            log.warning("Queue full, event dropped , File Path at: %s", dest.name)
+        except queue.Full:
+            log.warning("Queue full, event dropped, file: %s", dest.name)
 
         
 
@@ -135,7 +144,7 @@ class FileWatcher:
 
     Usage:
         q = queue.Queue()
-        watcher = FileWatcher(q)
+        watcher = FileWatcher(q, staging_dir=Path.home() / "Downloads")
         watcher.start()
         ...
         watcher.stop()
@@ -145,14 +154,21 @@ class FileWatcher:
         self,
         event_queue: queue.Queue,
         watch_dirs: list[Path] | None = None,
+        staging_dir: Path | None = None,
     ) -> None:
+        # FW-5: staging_dir from config so _is_staged agrees with gate_keeper's path
+        self._staging_dir = staging_dir or (Path.home() / "Downloads")
         self._queue = event_queue
         self._dirs = watch_dirs or _default_watch_dirs()
         self._observer = Observer()
-        self._handler = _FileCreatedHandler(event_queue)
+        self._handler = _FileCreatedHandler(event_queue, self._staging_dir)
 
     def start(self) -> None:
-        """Schedule all watch directories and start the observer thread."""
+        """Schedule all watch directories and start the observer thread.
+
+        FW-7: raises RuntimeError when no valid watch directory exists so the
+        daemon fails loudly rather than running silently idle.
+        """
         scheduled = 0
         for d in self._dirs:
             if not d.exists():
@@ -164,16 +180,23 @@ class FileWatcher:
             scheduled += 1
 
         if scheduled == 0:
-            log.error("No valid watch directories found — file watcher idle")
-            return
+            raise RuntimeError(
+                "No valid watch directories found — file watcher cannot start. "
+                f"Check that at least one of these paths exists: {self._dirs}"
+            )
 
         self._observer.start()
         log.info("FileWatcher started (%d dir(s))", scheduled)
 
     def stop(self) -> None:
-        """Stop the observer thread cleanly."""
+        """Stop the observer thread cleanly.
+
+        FW-6: join() has a 5s timeout so a hung observer never stalls shutdown.
+        """
         self._observer.stop()
-        self._observer.join()
+        self._observer.join(timeout=5)
+        if self._observer.is_alive():
+            log.warning("FileWatcher observer thread did not stop within 5s — may be hung")
         log.info("FileWatcher stopped")
 
 

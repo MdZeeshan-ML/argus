@@ -407,7 +407,8 @@ class ArgusDaemon:
         self._gate_keeper.setup()
 
         # -- File watcher --
-        self._file_watcher = FileWatcher(self._event_queue)
+        # FW-5: pass staging_dir from config so _is_staged agrees with gate_keeper
+        self._file_watcher = FileWatcher(self._event_queue, staging_dir=cfg["staging_dir"])
         self._file_watcher.start()
 
         # Audit fix: files downloaded while the daemon was OFF were stranded in
